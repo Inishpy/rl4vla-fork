@@ -40,18 +40,18 @@ class Args:
     name: str = "PPO-test"
 
     # env
-    num_envs: int = 64
+    num_envs: int = 32
     episode_len: int = 80
     use_same_init: bool = False
 
     steps_max: int = 2000000
     steps_vh: int = 0  # episodes
-    interval_eval: int = 10
+    interval_eval: int = 1
     interval_save: int = 40
 
     # buffer
-    buffer_inferbatch: int = 32
-    buffer_minibatch: int = 8
+    buffer_inferbatch: int = 4
+    buffer_minibatch: int = 2
     buffer_gamma: float = 0.99
     buffer_lambda: float = 0.95
 
@@ -76,9 +76,12 @@ class Args:
     alg_entropy_coef: float = 0.0
 
     # other
-    wandb: bool = True
+    wandb: bool = False
     only_render: bool = False
     render_info: bool = False
+    
+    # evaluation
+    num_eval_runs: int = 5
 
 
 
@@ -120,6 +123,11 @@ class Runner:
         unnorm_state = self.policy.vla.get_action_stats(self.args.vla_unnorm_key)
         self.env = SimlerWrapper(self.args, unnorm_state)
 
+        # ADD THESE LINES HERE:
+        torch.cuda.empty_cache()
+        gc.collect()
+        print(f"Memory after env init: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
+        
         # buffer
         self.buffer = SeparatedReplayBuffer(
             all_args,
@@ -323,6 +331,12 @@ class Runner:
         return env_stats_ret
 
     def run(self):
+        # ADD AT THE BEGINNING:
+        torch.cuda.empty_cache()
+        gc.collect()
+        print(f"Memory before training: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
+        
+        #env is created to run in paralled to totalsteps= num_envs * episode_len * episodes
         max_episodes = self.args.steps_max // self.args.episode_len // self.args.num_envs
 
         for episode in range(max_episodes):
@@ -369,13 +383,31 @@ class Runner:
             # eval
             if episode % self.args.interval_eval == self.args.interval_eval - 1 or episode == max_episodes - 1:
                 print(f"Evaluating at {steps}")
-                sval_stats = self.eval(obj_set="train")
-                sval_stats = {f"eval/{k}": v for k, v in sval_stats.items()}
-                wandb.log(sval_stats, step=steps)
 
-                sval_stats = self.eval(obj_set="test")
-                sval_stats = {f"eval/{k}_ood": v for k, v in sval_stats.items()}
+                def aggregate_eval(runs):
+                    # runs: list of dicts
+                    keys = runs[0].keys()
+                    mean = {k: np.mean([d[k] for d in runs]) for k in keys}
+                    std = {k: np.std([d[k] for d in runs]) for k in keys}
+                    return mean, std
+
+                # For "train" set
+                train_eval_runs = [self.eval(obj_set="train") for _ in range(self.args.num_eval_runs)]
+                train_mean, train_std = aggregate_eval(train_eval_runs)
+                sval_stats = {f"eval/{k}": v for k, v in train_mean.items()}
+                sval_stats.update({f"eval/{k}_std": train_std[k] for k in train_mean})
                 wandb.log(sval_stats, step=steps)
+                print("Train eval mean:", pprint.pformat({k: round(v, 4) for k, v in train_mean.items()}))
+                print("Train eval std:", pprint.pformat({k: round(v, 4) for k, v in train_std.items()}))
+
+                # For "test" set
+                test_eval_runs = [self.eval(obj_set="test") for _ in range(self.args.num_eval_runs)]
+                test_mean, test_std = aggregate_eval(test_eval_runs)
+                sval_stats = {f"eval/{k}_ood": v for k, v in test_mean.items()}
+                sval_stats.update({f"eval/{k}_ood_std": test_std[k] for k in test_mean})
+                wandb.log(sval_stats, step=steps)
+                print("Test eval mean:", pprint.pformat({k: round(v, 4) for k, v in test_mean.items()}))
+                print("Test eval std:", pprint.pformat({k: round(v, 4) for k, v in test_std.items()}))
 
             # save
             if episode % self.args.interval_save == self.args.interval_save - 1 or episode == max_episodes - 1:
