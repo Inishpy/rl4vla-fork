@@ -2,10 +2,12 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2505.19789-red.svg)](http://arxiv.org/abs/2505.19789)
 [![Website](https://img.shields.io/badge/Website-RLVLA-green.svg)](https://rlvla.github.io)
+[![HuggingFace](https://img.shields.io/badge/HuggingFace-models-yellow.svg)](https://huggingface.co/collections/gen-robot/rlvla-684bc48aa6cf28bac37c57a2)
 
 ## Introduction
 
 This repository contains the code for the paper [What Can RL Bring to VLA Generalization? An Empirical Study](https://arxiv.org/abs/2505.19789).
+The pretrained checkpoints are available at [HuggingFace](https://huggingface.co/collections/gen-robot/rlvla-684bc48aa6cf28bac37c57a2).
 
 ## Install
 
@@ -66,11 +68,13 @@ pip install scipy==1.12.0
 cd SimplerEnv && pip install -e . && cd ..
 ```
 
-## Train - RL
+## Train
 
-### Collect Data with Octo-Small
+### Warm-up OpenVLA
 
-Collect data with Octo-Small. Average Octo-Small success rate is about 14% on this task.
+#### Collect Data with Octo-Small
+
+Collect data with Octo-Small to build the warm-up dataset. Average Octo-Small success rate is about 14% on this task.
 
 ```bash
 conda activate octo_env
@@ -86,9 +90,9 @@ python simpler_env/eval_ms3_collect.py \
 # try to increase `num-episodes` if not enough successful trajectories is collected
 ```
 
-### Collect Data with motion planner
+#### Collect Data with motion planner
 
-Collect data with motion planner.
+Collect data with motion planner to build the warm-up dataset and SFT dataset.
 
 ```bash
 conda activate rlvla_env
@@ -98,7 +102,7 @@ cuda=0
 # for OpenVLA warm-up (extra 5 trajectories for performance evaluation)
 CUDA_VISIBLE_DEVICES=$cuda \
 python -m mani_skill.examples.motionplanning.widowx.collect_simpler \
-  -e "PutCarrotOnPlateInScene-v1" \
+  -e "PutOnPlateInScene25Single-v1" \
   --save_video --save_data --num_procs 1 --num_traj 75 --seed=0
 
 # for SFT (extra 16 trajectories for performance evaluation)
@@ -108,7 +112,7 @@ python -m mani_skill.examples.motionplanning.widowx.collect_simpler \
   --save_video --save_data --num_procs 16 --num_traj 16400 --seed=100
 ```
 
-### Build VLA Warm-up Dataset
+#### Build VLA Warm-up Dataset
 
 ```bash
 conda activate rlds_env
@@ -120,7 +124,7 @@ mkdir -p datasets
 mv -T ~/tensorflow_datasets/example_dataset datasets/warmup
 ```
 
-### Warm-up OpenVLA
+#### Warm-up OpenVLA
 
 ```bash
 conda activate rlvla_env
@@ -130,7 +134,7 @@ cd openvla
 cuda="0,1,2,3"
 task_name="warmup"
 
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=$cuda$ \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=$cuda \
 torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
   --vla_path "openvla/openvla-7b" \
   --data_root_dir "../datasets" \
@@ -154,14 +158,14 @@ torchrun --standalone --nnodes 1 --nproc-per-node 4 vla-scripts/finetune.py \
 cuda="0"
 task_name="warmup"
 
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=$cuda$ \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=$cuda \
 torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/merge_lora.py \
   --vla_path "openvla/openvla-7b" \
   --run_path "checkpoints/${task_name}/steps_2000" \
   --lora_name "lora_002000"
 ```
 
-### RL Train
+### RL
 
 ```bash
 conda activate rlvla_env
@@ -183,7 +187,9 @@ python simpler_env/train_ms3_ppo.py \
 - GRPO (s): add `--alg_name="grpo"` and `--use_same_init`
 - PPO from scratch: remove `--vla_load_path` arg
 
-### Build OpenVLA SFT Dataset
+### SFT
+
+#### Build OpenVLA SFT Dataset
 
 ```bash
 conda activate rlds_env
@@ -197,7 +203,7 @@ mkdir -p datasets
 mv -T ~/tensorflow_datasets/example_dataset datasets/sft
 ```
 
-### SFT Train
+#### SFT Train
 
 ```bash
 conda activate rlvla_env
@@ -225,18 +231,29 @@ torchrun --standalone --nnodes 1 --nproc-per-node 4 ../openvla/vla-scripts/finet
 
 ## Evaluate
 
+### Trained from scratch
+
 ```bash
 conda activate rlvla_env
 cd SimplerEnv
 
+# Warm-up
+ckpt_path="openvla/openvla-7b"
+unnorm_key="bridge_orig"
+vla_load_path="../openvla/checkpoints/warmup/steps_2000/lora_002000"
+
+# RL
+ckpt_path="openvla/openvla-7b"
+unnorm_key="bridge_orig"
+vla_load_path="../SimplerEnv/wandb/run-xxx-xxx/glob/steps_xxx" # replace with the actual path
+
 # SFT
+ckpt_path="../openvla/checkpoints/warmup/steps_2000/merged_002000"
 unnorm_key="sft"
 vla_load_path="../openvla/checkpoints/sft/steps_60000-no_aug/lora_060000"
-# RL
-unnorm_key="bridge_orig"
-vla_load_path="../Simpler/wandb/run-xxx-xxx/glob/steps_xxx"
 
 
+# start evaluation
 for seed in 0 1 2 ; do
     for env_id in 
       "PutOnPlateInScene25VisionImage-v1" "PutOnPlateInScene25VisionTexture03-v1" "PutOnPlateInScene25VisionTexture05-v1" \ 
@@ -246,7 +263,6 @@ for seed in 0 1 2 ; do
       "PutOnPlateInScene25Position-v1" "PutOnPlateInScene25EEPose-v1" "PutOnPlateInScene25PositionChangeTo-v1" ; \ 
     do
     
-      ckpt_path="../openvla/checkpoints/warmup/steps_2000/merged_002000"
       CUDA_VISIBLE_DEVICES=$cuda XLA_PYTHON_CLIENT_PREALLOCATE=false \
       python simpler_env/train_ms3_ppo.py \
         --vla_path="${ckpt_path}" --vla_unnorm_key="${unnorm_key}" \
@@ -261,7 +277,30 @@ done
 # for 40G GPU, set `--buffer_inferbatch=16` to avoid OOM
 ```
 
-Gather results:
+### Pre-trained checkpoints
+
+The pretrained checkpoints (warm-upped, RL and SFT) are available at [HuggingFace](https://huggingface.co/collections/gen-robot/rlvla-684bc48aa6cf28bac37c57a2).
+Follow the evaluation scripts in the above section, and replace the environment variable with the pretrained checkpoint path.
+
+```bash
+# Warm-up (pretrained)
+ckpt_path="gen-robot/openvla-7b-rlvla-warmup"
+unnorm_key="bridge_orig"
+vla_load_path=""
+
+# RL (pretrained)
+ckpt_path="gen-robot/openvla-7b-rlvla-rl"
+unnorm_key="bridge_orig"
+vla_load_path=""
+
+# SFT (pretrained)
+ckpt_path="gen-robot/openvla-7b-rlvla-sft_16k"
+unnorm_key="sft"
+vla_load_path=""
+```
+
+
+### Gather results
 
 1. Option 1: Manually check the results and visualization videos: at `SimplerEnv/wandb/offline-run-xxx-xxx/glob/`
 2. Option 2: Calculate statistics: at `SimplerEnv/scripts` run `python calc_statistics.py`, then check the results at `SimplerEnv/scripts/stats`

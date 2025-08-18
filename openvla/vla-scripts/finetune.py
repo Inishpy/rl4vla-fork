@@ -258,7 +258,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
 
     # Initialize Logging =>> W&B
-    if distributed_state.is_main_process:
+    if False: #distributed_state.is_main_process:
         name = f"{cfg.dataset_name}-{exp_id}"
         wandb.init(project=cfg.wandb_project, name=name)
 
@@ -322,7 +322,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
 
             # Push Metrics to W&B (every 10 gradient steps)
-            if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
+            if False:
                 wandb.log(
                     {
                         "train_loss": smoothened_loss,
@@ -379,7 +379,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 eval_action_accuracy = sum(eval_action_accuracies) / len(eval_action_accuracies)
                 eval_l1_loss = sum(eval_l1_losses) / len(eval_l1_losses)
 
-                if distributed_state.is_main_process:
+                if False:
                     wandb.log(
                         {
                             "eval_loss": eval_loss,

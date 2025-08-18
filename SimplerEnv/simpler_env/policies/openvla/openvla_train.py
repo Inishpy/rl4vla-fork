@@ -233,7 +233,7 @@ class OpenVLAPolicy:
 
         self.vla = OpenVLAForActionPredictionWithValueHead.from_pretrained(
             self.args.vla_path,
-            attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
+            # attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
