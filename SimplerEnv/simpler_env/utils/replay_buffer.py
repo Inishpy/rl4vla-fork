@@ -22,6 +22,7 @@ class SeparatedReplayBuffer(object):
         self.advantages = np.zeros((self.ep_len, self.num_env, 1), dtype=np.float32)
 
         self.step = 0
+        self.full = False  # Indicates if buffer has been filled at least once
 
     def insert(self, obs, actions, action_log_probs, value_preds, rewards, masks):
         self.obs[self.step + 1] = obs.copy()
@@ -32,6 +33,10 @@ class SeparatedReplayBuffer(object):
         self.masks[self.step + 1] = masks.copy()
 
         self.step = (self.step + 1) % self.ep_len
+        # Set full flag if we've wrapped around (i.e., completed an episode)
+        if self.step == 0:
+            self.full = True
+        print(f"[ReplayBuffer] After insert: step={self.step} (buffer size indicator), ep_len={self.ep_len}, full={self.full}")
 
     def warmup(self, obs, instruction):
         self.obs[0] = obs
@@ -39,6 +44,8 @@ class SeparatedReplayBuffer(object):
         self.masks[0] = 1.0
 
         self.step = 0
+        self.full = False
+        print(f"[ReplayBuffer] After warmup: step={self.step} (buffer reset), ep_len={self.ep_len}, full={self.full}")
 
     def endup(self, next_value):
         self.value_preds[-1] = next_value
