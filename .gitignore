@@ -14,9 +14,13 @@ __pycache__
 
 /octo/
 /datasets/
-/Maniskill/mp_collect/
+/ManiSkill/mp_collect/
 /openvla/checkpoints/
 /openvla/wandb/
-/SimpleEnv/octo_collect/
-/SimpleEnv/wandb/
+/SimplerEnv/octo_collect/
+/SimplerEnv/wandb/
+/SimplerEnv/logs/
+/wandb/
+*.log
+*.out
 

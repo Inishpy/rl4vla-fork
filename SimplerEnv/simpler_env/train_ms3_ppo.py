@@ -11,11 +11,19 @@ import torch
 import numpy as np
 import tyro
 import wandb
+import subprocess
 from dataclasses import dataclass
 import yaml
 from tqdm import tqdm
 from mani_skill.utils import visualization
 from mani_skill.utils.visualization.misc import images_to_video
+
+# Added for logging and Excel
+import datetime
+import pandas as pd
+import contextlib
+import sys
+import logging
 
 from simpler_env.env.simpler_wrapper import SimlerWrapper
 from simpler_env.utils.replay_buffer import SeparatedReplayBuffer
@@ -26,7 +34,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 @dataclass
 class Args:
-    env_id: Annotated[str, tyro.conf.arg(aliases=["-e"])] = "PutCarrotOnPlateInScene-v1"
+    env_id: Annotated[str, tyro.conf.arg(aliases=["-e"])] = "StackGreenCubeOnYellowCubeBakedTexInScene-v1"
     """The environment ID of the task you want to simulate. Can be one of
     PutCarrotOnPlateInScene-v1, PutSpoonOnTableClothInScene-v1, StackGreenCubeOnYellowCubeBakedTexInScene-v1, PutEggplantInBasketScene-v1"""
 
@@ -44,10 +52,10 @@ class Args:
     episode_len: int = 80
     use_same_init: bool = False
 
-    steps_max: int = 2000000
+    steps_max: int = 200000
     steps_vh: int = 0  # episodes
-    interval_eval: int = 1
-    interval_save: int = 40
+    interval_eval: int = 10
+    interval_save: int = 25
 
     # buffer
     buffer_inferbatch: int = 4
@@ -81,14 +89,16 @@ class Args:
     render_info: bool = False
     
     # evaluation
-    num_eval_runs: int = 5
+    num_eval_runs: int = 10
 
 
 
 class Runner:
-    def __init__(self, all_args: Args):
+    def __init__(self, all_args: Args, train_xlsx=None, test_xlsx=None):
         self.args = all_args
-
+        self.train_xlsx = train_xlsx  # Store log directory for Excel output
+        self.test_xlsx = test_xlsx
+        
         # alg_name
         assert self.args.alg_name in ["ppo", "grpo"]
 
@@ -400,6 +410,29 @@ class Runner:
                 print("Train eval mean:", pprint.pformat({k: round(v, 4) for k, v in train_mean.items()}))
                 print("Train eval std:", pprint.pformat({k: round(v, 4) for k, v in train_std.items()}))
 
+                # --- Append to train Excel ---
+                if self.train_xlsx is not None:
+                    
+                    
+                    # Only append steps and mean_success
+                    mean_success = None
+                    for k, v in train_mean.items():
+                        if "success" in k:
+                            mean_success = v
+                            break
+                    train_row = {"steps": steps, "mean_success": mean_success}
+                    try:
+                        df = pd.read_excel(self.train_xlsx)
+                        df = pd.concat([df, pd.DataFrame([train_row])], ignore_index=True)
+                    except Exception:
+                        df = pd.DataFrame([train_row])
+                        
+                    print(df)
+                    train_xlsx_path = Path(self.train_xlsx)
+                    train_xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+                    df.to_excel(self.train_xlsx, index=False)
+                    logging.info(f"Appended to train.xlsx: steps={steps}, mean_success={mean_success}")
+
                 # For "test" set
                 test_eval_runs = [self.eval(obj_set="test") for _ in range(self.args.num_eval_runs)]
                 test_mean, test_std = aggregate_eval(test_eval_runs)
@@ -409,11 +442,31 @@ class Runner:
                 print("Test eval mean:", pprint.pformat({k: round(v, 4) for k, v in test_mean.items()}))
                 print("Test eval std:", pprint.pformat({k: round(v, 4) for k, v in test_std.items()}))
 
+                # --- Append to test Excel ---
+                if self.test_xlsx is not None:
+                    
+                    # Only append steps and mean_success
+                    mean_success = None
+                    for k, v in test_mean.items():
+                        if "success" in k:
+                            mean_success = v
+                            break
+                    test_row = {"steps": steps, "mean_success": mean_success}
+                    try:
+                        df = pd.read_excel(self.test_xlsx)
+                        df = pd.concat([df, pd.DataFrame([test_row])], ignore_index=True)
+                    except Exception:
+                        df = pd.DataFrame([test_row])
+                    test_xlsx_path = Path(self.test_xlsx)
+                    test_xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+                    df.to_excel(self.test_xlsx, index=False)
+                    logging.info(f"Appended to test.xlsx: steps={steps}, mean_success={mean_success}")
+
             # save
             if episode % self.args.interval_save == self.args.interval_save - 1 or episode == max_episodes - 1:
                 print(f"Saving model at {steps}")
                 save_path = self.glob_dir / f"steps_{episode:0>4d}"
-                self.policy.save(save_path)
+                #self.policy.save(save_path)
 
                 self.render(epoch=episode, obj_set="train")
                 self.render(epoch=episode, obj_set="test")
@@ -421,7 +474,36 @@ class Runner:
 
 def main():
     args = tyro.cli(Args)
-    runner = Runner(args)
+    # --- Logging and logdir setup ---
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path("logs") / timestamp / args.env_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "log.txt"
+
+    # Create empty train.xlsx and test.xlsx at the beginning
+    train_xlsx = log_dir / "train.xlsx"
+    test_xlsx = log_dir / "test.xlsx"
+    pd.DataFrame().to_excel(train_xlsx, index=False)
+    pd.DataFrame().to_excel(test_xlsx, index=False)
+
+    # Redirect stdout and stderr to log.txt
+    log_fh = open(log_file, "a")
+    sys.stdout = log_fh
+    sys.stderr = log_fh
+
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(log_fh)
+        ]
+    )
+    logging.info("Logging started. Log file: %s", log_file)
+
+    
+    runner = Runner(args, train_xlsx, test_xlsx)
 
     if args.only_render:
         ll = [
@@ -443,6 +525,8 @@ def main():
         runner.render(epoch=0, obj_set="test")
     else:
         runner.run()
+    # Close log file at end
+    log_fh.close()
 
 
 if __name__ == "__main__":
