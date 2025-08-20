@@ -19,6 +19,10 @@ __pycache__
 /openvla/wandb/
 /SimplerEnv/octo_collect/
 /SimplerEnv/wandb/
+/SimplerEnv/logs/
+/wandb/
+*.log
+*.out
 
 nohup.out
 
