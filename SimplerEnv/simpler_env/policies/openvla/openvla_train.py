@@ -113,6 +113,20 @@ class OpenVLAPolicy:
         task_description = x["task_description"]
 
         assert isinstance(images, torch.Tensor)
+        # Debug: Print shape and dtype for diagnosis
+        print(f"[DEBUG] images.shape={images.shape}, images.dtype={images.dtype}, type={type(images)}")
+        print(f"[DEBUG] task_description={task_description}, type={type(task_description)}")
+        # Robust fix: Try to make images 4D if possible
+        if len(images.shape) == 3:
+            images = images.unsqueeze(0)
+        elif len(images.shape) > 4:
+            images = images.squeeze()
+        if len(images.shape) != 4:
+            raise ValueError(f"[ERROR] images must be 4D, got shape {images.shape} and type {type(images)}")
+        if images.shape[-1] != 3:
+            raise ValueError(f"[ERROR] images last dimension must be 3 (channels), got {images.shape[-1]}")
+        if images.dtype != torch.uint8:
+            images = images.to(torch.uint8)
         assert len(images.shape) == 4
         assert images.shape[3] == 3
         assert images.dtype == torch.uint8
@@ -130,7 +144,8 @@ class OpenVLAPolicy:
                            for t in task_description]
         else:
             assert isinstance(action, torch.Tensor)
-            # action = action.cpu().numpy() # [B, dim]
+            # Ensure action is integer type for tokenizer
+            action = action.to(torch.int64)
             action_str = self.tokenizer.batch_decode(action)
 
             task_prompt = [f"In: What action should the robot take to {t.lower()}?\nOut: {a}</s>"

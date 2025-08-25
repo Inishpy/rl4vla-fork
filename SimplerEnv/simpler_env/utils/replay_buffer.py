@@ -23,8 +23,37 @@ class SeparatedReplayBuffer(object):
 
         self.step = 0
         self.full = False  # Indicates if buffer has been filled at least once
+        self.count = 0
+
+    def _print_buffer_summary(self, context=""):
+        import numpy as np
+        np.set_printoptions(threshold=np.inf, linewidth=200)
+        #print(f"\n[ReplayBuffer] {context} step={self.step}, full={self.full}")
+        # Determine number of samples in buffer
+        num_samples = self.ep_len if self.full else self.step
+        print(f"  Number of samples in buffer: {num_samples}")
+        # Print all buffer contents up to current step
+        obs_slice = self.obs[1:self.ep_len+1] if self.full else self.obs[1:self.step+1]
+        actions_slice = self.actions[:self.ep_len] if self.full else self.actions[:self.step]
+        rewards_slice = self.rewards[:self.ep_len] if self.full else self.rewards[:self.step]
+        masks_slice = self.masks[1:self.ep_len+1] if self.full else self.masks[1:self.step+1]
+        value_preds_slice = self.value_preds[:self.ep_len] if self.full else self.value_preds[:self.step]
+        action_log_probs_slice = self.action_log_probs[:self.ep_len] if self.full else self.action_log_probs[:self.step]
+        returns_slice = self.returns[:self.ep_len] if self.full else self.returns[:self.step]
+        advantages_slice = self.advantages[:self.ep_len] if self.full else self.advantages[:self.step]
+        # print(f"  obs:\n{obs_slice}")
+        # print(f"  actions:\n{actions_slice}")
+        # print(f"  rewards:\n{rewards_slice}")
+        # print(f"  masks:\n{masks_slice}")
+        # print(f"  value_preds:\n{value_preds_slice}")
+        # print(f"  action_log_probs:\n{action_log_probs_slice}")
+        # print(f"  returns:\n{returns_slice}")
+        # print(f"  advantages:\n{advantages_slice}")
+        # print(f"  instruction:\n{self.instruction}")
+        # print("")
 
     def insert(self, obs, actions, action_log_probs, value_preds, rewards, masks):
+        self.count = self.count + 1
         self.obs[self.step + 1] = obs.copy()
         self.actions[self.step] = actions.copy()
         self.action_log_probs[self.step] = action_log_probs.copy()
@@ -37,6 +66,7 @@ class SeparatedReplayBuffer(object):
         if self.step == 0:
             self.full = True
         print(f"[ReplayBuffer] After insert: step={self.step} (buffer size indicator), ep_len={self.ep_len}, full={self.full}")
+        self._print_buffer_summary("After insert")
 
     def warmup(self, obs, instruction):
         self.obs[0] = obs
@@ -46,6 +76,7 @@ class SeparatedReplayBuffer(object):
         self.step = 0
         self.full = False
         print(f"[ReplayBuffer] After warmup: step={self.step} (buffer reset), ep_len={self.ep_len}, full={self.full}")
+        self._print_buffer_summary("After warmup")
 
     def endup(self, next_value):
         self.value_preds[-1] = next_value
@@ -132,3 +163,50 @@ class SeparatedReplayBuffer(object):
 
             yield (obs_batch, instruct_batch, actions_batch, value_preds_batch, return_batch, masks_batch,
                    old_action_logits_batch, adv_targ)
+
+class FifoReplayBuffer:
+    """
+    FIFO replay buffer for off-policy or hybrid RL, supporting random sampling and large capacity.
+    Stores transitions as tuples: (obs, action, reward, next_obs, done, info)
+    """
+    def __init__(self, capacity, obs_shape, action_shape, dtype_obs=np.float32, dtype_action=np.float32):
+        self.capacity = capacity
+        self.obs_shape = obs_shape
+        self.action_shape = action_shape
+        self.dtype_obs = dtype_obs
+        self.dtype_action = dtype_action
+
+        self.obs = np.zeros((capacity, *obs_shape), dtype=dtype_obs)
+        self.actions = np.zeros((capacity, *action_shape), dtype=dtype_action)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, *obs_shape), dtype=dtype_obs)
+        self.dones = np.zeros((capacity,), dtype=np.bool_)
+        self.infos = [None] * capacity
+
+        self.ptr = 0
+        self.size = 0
+
+    def insert(self, obs, action, reward, next_obs, done, info=None):
+        self.obs[self.ptr] = obs
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.next_obs[self.ptr] = next_obs
+        self.dones[self.ptr] = done
+        self.infos[self.ptr] = info
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size):
+        assert self.size >= batch_size, "Not enough samples in buffer"
+        idxs = np.random.choice(self.size, batch_size, replace=False)
+        return {
+            "observations": self.obs[idxs],
+            "actions": self.actions[idxs],
+            "rewards": self.rewards[idxs],
+            "next_observations": self.next_obs[idxs],
+            "dones": self.dones[idxs],
+            "instruction": [self.infos[i] for i in idxs]
+        }
+
+    def __len__(self):
+        return self.size

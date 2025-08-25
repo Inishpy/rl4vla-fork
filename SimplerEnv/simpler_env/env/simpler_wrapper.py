@@ -25,7 +25,10 @@ class SimlerWrapper:
             max_episode_steps=self.args.episode_len,
             sensor_configs={"shader_pack": "default"},
         )
+        
+        
         self.env: BaseEnv = gym.make(**env_config)
+        print(self.env)
         self.env.reset(seed=[self.args.seed * 1000 + i + extra_seed for i in range(self.args.num_envs)])
 
         # variables
@@ -99,6 +102,12 @@ class SimlerWrapper:
         obs, info = self.env.reset(options=options)
         obs_image = obs["sensor_data"]["3rd_view_camera"]["rgb"].to(torch.uint8)
         instruction = self.env.unwrapped.get_language_instruction()
+        # Ensure instruction is a list of length num_envs
+        if isinstance(instruction, str):
+            instruction = [instruction] * self.num_envs
+        elif isinstance(instruction, list):
+            if len(instruction) != self.num_envs:
+                instruction = [instruction[0]] * self.num_envs
 
         self.reward_old = torch.zeros(self.num_envs, 1, dtype=torch.float32).to(obs_image.device)  # [B, 1]
 
@@ -110,6 +119,13 @@ class SimlerWrapper:
         obs, _reward, _terminated, truncated, info = self.env.step(action)
         obs_image = obs["sensor_data"]["3rd_view_camera"]["rgb"].to(torch.uint8)
         truncated = truncated.reshape(-1, 1)  # [B, 1]
+        # Ensure instruction is a list of length num_envs after step as well
+        instruction = self.env.unwrapped.get_language_instruction()
+        if isinstance(instruction, str):
+            instruction = [instruction] * self.num_envs
+        elif isinstance(instruction, list):
+            if len(instruction) != self.num_envs:
+                instruction = [instruction[0]] * self.num_envs
 
         # calculate reward
         reward = self.get_reward(info)
@@ -121,4 +137,4 @@ class SimlerWrapper:
                 v = [info[k][idx].item() for idx in range(self.num_envs)]
                 info["episode"][k] = v
 
-        return obs_image, reward, truncated, info
+        return obs_image, reward, truncated, info, instruction
