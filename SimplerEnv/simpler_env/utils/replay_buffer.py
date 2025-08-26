@@ -132,3 +132,53 @@ class SeparatedReplayBuffer(object):
 
             yield (obs_batch, instruct_batch, actions_batch, value_preds_batch, return_batch, masks_batch,
                    old_action_logits_batch, adv_targ)
+
+
+
+
+class FifoReplayBuffer:
+    """
+    FIFO replay buffer for off-policy or hybrid RL, supporting random sampling and large capacity.
+    Stores transitions as tuples: (obs, action, reward, next_obs, done, info)
+    """
+    def __init__(self, capacity, obs_shape, action_shape, dtype_obs=np.float32, dtype_action=np.float32):
+        self.capacity = capacity
+        self.obs_shape = obs_shape
+        self.action_shape = action_shape
+        self.dtype_obs = dtype_obs
+        self.dtype_action = dtype_action
+
+        self.obs = np.zeros((capacity, *obs_shape), dtype=dtype_obs)
+        self.actions = np.zeros((capacity, *action_shape), dtype=dtype_action)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, *obs_shape), dtype=dtype_obs)
+        self.dones = np.zeros((capacity,), dtype=np.bool_)
+        self.infos = [None] * capacity
+
+        self.ptr = 0
+        self.size = 0
+
+    def insert(self, obs, action, reward, next_obs, done, info=None):
+        self.obs[self.ptr] = obs
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.next_obs[self.ptr] = next_obs
+        self.dones[self.ptr] = done
+        self.infos[self.ptr] = info
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size):
+        assert self.size >= batch_size, "Not enough samples in buffer"
+        idxs = np.random.choice(self.size, batch_size, replace=False)
+        return {
+            "observations": self.obs[idxs],
+            "actions": self.actions[idxs],
+            "rewards": self.rewards[idxs],
+            "next_observations": self.next_obs[idxs],
+            "dones": self.dones[idxs],
+            "instruction": [self.infos[i] for i in idxs]
+        }
+
+    def __len__(self):
+        return self.size
