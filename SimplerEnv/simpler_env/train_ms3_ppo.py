@@ -34,9 +34,17 @@ from simpler_env.utils.replay_buffer import SeparatedReplayBuffer
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import os
+from dotenv import load_dotenv
+import wandb
 
+# Load environment variables from .env
+load_dotenv()
 
+api_key = os.getenv("WANDB_API_KEY")
 
+# Login to Weights & Biases
+wandb.login(key=api_key)
 
 @dataclass
 class Args:
@@ -50,7 +58,7 @@ class Args:
 
     seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 0
     name: str = "MOSAIC-test"
-    num_envs: int = 16
+    num_envs: int = 32
     episode_len: int = 80
     use_same_init: bool = False
     steps_max: int = 2000000
@@ -76,17 +84,17 @@ class Args:
     alg_gradient_accum: int = 20
     alg_ppo_epoch: int = 1
     alg_entropy_coef: float = 0.0
-    wandb: bool = False
+    wandb: bool = True
     only_render: bool = False
     render_info: bool = False
     num_eval_runs: int = 1
     # MOSAIC-specific args
     force_sharing_test: bool = False
-    comm_interval: int = 1
+    comm_interval: int = 3
     agent_id: int = 0
     all_envs: str = ""
-    lora_sparsity: float = 0.1  # Top-10% weights kept
-    sim_threshold: float = 0.7  # Cosine similarity threshold for mask sharing
+    lora_sparsity: float = 1.0  # Top-10% weights kept
+    sim_threshold: float = 0.5  # Cosine similarity threshold for mask sharing
 
 class Runner:
     def __init__(self, all_args: Args, train_xlsx=None, test_xlsx=None, Q_emb=None, Q_mask=None, barrier=None):
@@ -112,6 +120,7 @@ class Runner:
             project="RLVLA-MOSAIC",
             name=self.args.name,
             mode="online" if self.args.wandb else "offline",
+            reinit=True,
         )
         self.save_dir = Path(wandb.run.dir)
         self.glob_dir = Path(wandb.run.dir) / ".." / "glob"
@@ -685,7 +694,7 @@ class Runner:
             del value, action, logprob, obs_img, reward, done
             
             # MOSAIC: Share and receive masks and compute embeddings
-            self.share_and_receive(episode)
+            #self.share_and_receive(episode)
             
             infos = self.train()
             

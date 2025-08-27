@@ -33,6 +33,10 @@ rm flash_attn-2.7.4.post1+cu12torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 cd ManiSkill && pip install -e . && cd ..
 cd SimplerEnv && pip install -e . && cd ..
 
+
+pip install pot
+pip install openpyxl
+
 # optional: for ubuntu 2204
 # sudo apt-get install libglvnd-dev
 ```
