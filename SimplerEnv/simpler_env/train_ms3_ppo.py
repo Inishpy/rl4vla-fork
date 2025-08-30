@@ -58,12 +58,13 @@ class Args:
 
     seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 0
     name: str = "MOSAIC-test"
+    
     num_envs: int = 32
     episode_len: int = 80
     use_same_init: bool = False
     steps_max: int = 2000000
     steps_vh: int = 0
-    interval_eval: int = 2
+    interval_eval: int = 3
     interval_save: int = 40
     buffer_inferbatch: int = 4  #for rollout just pass chunks of env data to save memory
     buffer_minibatch: int = 2   #for training just pass chunks of stored buffer samples to save memory  
@@ -90,19 +91,23 @@ class Args:
     num_eval_runs: int = 1
     # MOSAIC-specific args
     force_sharing_test: bool = False
-    comm_interval: int = 3
+    comm_interval: int = 2
     agent_id: int = 0
     all_envs: str = ""
     lora_sparsity: float = 1.0  # Top-10% weights kept
     sim_threshold: float = 0.5  # Cosine similarity threshold for mask sharing
 
 class Runner:
-    def __init__(self, all_args: Args, train_xlsx=None, test_xlsx=None, Q_emb=None, Q_mask=None, barrier=None):
+    def __init__(self, all_args: Args, train_xlsx=None, test_xlsx=None, shared_teqs=None, shared_masks=None, barrier=None, manager=None):
         self.args = all_args
         self.train_xlsx = train_xlsx  # Store log directory for Excel output
         self.test_xlsx = test_xlsx
-        self.Q_emb = Q_emb
-        self.Q_mask = Q_mask
+        # self.Q_emb = Q_emb
+        # self.Q_mask = Q_mask
+        self.shared_teqs = shared_teqs
+        self.shared_masks = shared_masks
+        self.manager = manager
+        
         self.barrier = barrier
         self.all_envs = all_args.all_envs.split(",") if all_args.all_envs else [all_args.env_id]
         self.task_idx = self.all_envs.index(all_args.env_id) if all_args.env_id in self.all_envs else 0
@@ -118,7 +123,7 @@ class Runner:
         wandb.init(
             config=all_args.__dict__,
             project="RLVLA-MOSAIC",
-            name=self.args.name,
+            name=self.args.env_id + "_" + str(self.args.seed),
             mode="online" if self.args.wandb else "offline",
             reinit=True,
         )
@@ -156,6 +161,7 @@ class Runner:
             obs_dim=(480, 640, 3),
             act_dim=7,
         )
+        
         # Add FIFO buffer for embeddings/task similarity
         from simpler_env.utils.replay_buffer import FifoReplayBuffer
         self.buffer_fifo = FifoReplayBuffer(
@@ -171,7 +177,7 @@ class Runner:
         self.performance = 0.0  # Mean reward
         self.received_masks = {}  # Dict of {agent_id: LoRA_params}
 
-    def compute_task_embedding(self):
+    def compute_task_embedding_(self):
         """Compute Wasserstein Task Embedding from SAR trajectories using buffer_fifo."""
         # Sample SAR tuples from buffer_fifo
         num_samples = min(100, len(self.buffer_fifo))
@@ -182,7 +188,7 @@ class Runner:
         obs = self.buffer_fifo.obs[idxs]
         actions = self.buffer_fifo.actions[idxs]
         rewards = self.buffer_fifo.rewards[idxs]
-        
+        print("rewards", rewards)
         # Flatten and normalize (assumes images flattened)
         states = np.array([o.flatten() for o in obs]) / 255.0
         
@@ -202,6 +208,86 @@ class Runner:
         M = ot.dist(mu_tau, mu_0, metric='euclidean')
         v_tau = ot.emd2([], [], M)  # Embedding as Wasserstein vector
         return torch.tensor(v_tau, dtype=torch.float32, device=self.device)
+    
+ 
+
+    def compute_task_embedding(self, num_samples=128, M_ref=None, use_sinkhorn=True, sinkhorn_reg=1e-2):
+        """
+        Compute WTE embedding (barycenter projection) using samples from buffer_fifo.
+        Returns: torch.Tensor of shape (M_ref * d,) (flattened) or (M_ref, d) if reshape=False
+        Requirements: self.wte_reference must exist (M_ref x d numpy array), created once at init.
+        """
+        # 1) sample
+        num_available = len(self.buffer_fifo)
+        num_samples = min(num_samples, num_available)
+        if num_samples == 0:
+            raise ValueError("buffer_fifo is empty in compute_task_embedding. Cannot compute embedding.")
+
+        idxs = np.random.choice(num_available, num_samples, replace=False)
+        obs = self.buffer_fifo.obs[idxs]
+        actions = self.buffer_fifo.actions[idxs]
+        rewards = self.buffer_fifo.rewards[idxs]
+
+        # 2) build X (N x d)
+        # states: flatten images and scale to [0,1]
+        states = np.array([o.flatten() for o in obs], dtype=np.float64) / 255.0  # (N, ds)
+        # actions: normalize by max abs across batch (per your code)
+        if actions.size == 0:
+            raise ValueError("Actions array is empty in compute_task_embedding. Cannot normalize.")
+        
+        actions = actions.astype(np.float64)
+        max_act = np.max(np.abs(actions)) + 1e-9
+        actions_flat = actions / max_act
+        if actions_flat.ndim == 1:
+            actions_flat = actions_flat[:, None]  # ensure shape (N, da)
+        # rewards: normalize similarly
+        if rewards.size == 0:
+            raise ValueError("Rewards array is empty in compute_task_embedding. Cannot normalize.")
+        rewards = rewards.astype(np.float64)
+        max_r = np.max(np.abs(rewards)) + 1e-9
+        rewards_flat = (rewards / max_r)[:, None]
+
+        # Concatenate features -> X (N x d)
+        X = np.concatenate([states, actions_flat, rewards_flat], axis=1)  # dtype float64
+        N, d = X.shape
+
+        # 3) reference points
+        if M_ref is None:
+            if not hasattr(self, 'wte_reference'):
+                # initialize a reference set of M anchors in same feature range
+                M_ref = 50
+                # sample uniform in [-1,1]^d and then scale appropriately (or sample from data mean)
+                self.wte_reference = np.random.uniform(-1.0, 1.0, size=(M_ref, d)).astype(np.float64)
+            else:
+                M_ref = self.wte_reference.shape[0]
+        else:
+            if not hasattr(self, 'wte_reference'):
+                self.wte_reference = np.random.uniform(-1.0, 1.0, size=(M_ref, d)).astype(np.float64)
+
+        X0 = self.wte_reference  # shape (M_ref, d)
+
+        # 4) weights
+        a = np.ones(N, dtype=np.float64) / N  # source weights
+        b = np.ones(M_ref, dtype=np.float64) / M_ref  # target (reference) weights
+
+        # 5) cost matrix (squared Euclidean for 2-Wasserstein)
+        C = ot.dist(X, X0, metric='euclidean') ** 2  # shape (N, M_ref)
+
+        # 6) transport plan: use Sinkhorn (faster and regularized) or exact EMD
+        if use_sinkhorn:
+            # sinkhorn returns transport matrix (N x M_ref)
+            gamma = ot.sinkhorn(a, b, C, reg=sinkhorn_reg)  # shape (N, M_ref)
+        else:
+            gamma = ot.emd(a, b, C)  # exact; might be slower
+
+        # 7) barycenter projection -> embedding matrix V (M_ref x d)
+        # gamma is N x M_ref, we need gamma.T @ X -> (M_ref x d)
+        V = gamma.T.dot(X)  # shape (M_ref, d)
+
+        # optionally flatten to vector
+        v_flat = V.ravel()  # shape (M_ref * d,)
+        return torch.tensor(v_flat, dtype=torch.float32, device=self.device)
+
 
     def make_sparse_lora(self):
         """Apply top-k sparsity to LoRA parameters."""
@@ -234,14 +320,23 @@ class Runner:
             if param.requires_grad:
                 param.data.copy_(self.composed_params[lora_idx])
                 lora_idx += 1
+                
+                
+    # --- Utilities for safe append to manager dict of lists ---
+    def _ensure_episode_list(self, shared_dict, episode):
+        """Ensure shared_dict[episode] exists and is a manager.list()."""
+        if episode not in shared_dict:
+            # race: multiple agents may try to set; last write wins but all will append to the same list proxy object type
+            shared_dict[episode] = self.manager.list()
+        return shared_dict[episode]
 
-    def share_and_receive(self, episode):
+    def share_and_receive(self, episode, current_success):
         logging.info(f"[share_and_receive] Called at episode {episode}")
         
         if len(self.buffer_fifo) > 0:
             logging.info("[share_and_receive] FIFO buffer has data; proceeding to compute embedding and performance")
             self.task_embedding = self.compute_task_embedding()
-            logging.debug(f"[share_and_receive] Task embedding computed: shape={self.task_embedding.shape}, first few values={self.task_embedding}")  # Log sample for inspection
+            logging.info(f"[share_and_receive] Task embedding computed: shape={self.task_embedding.shape}, first few values={self.task_embedding}")  # Log sample for inspection
             
         try:
             if episode % self.args.comm_interval != 0:
@@ -281,6 +376,11 @@ class Runner:
                         logging.error("[share_and_receive] Failed to abort barrier (clear phase): %s", be, exc_info=True)
                     raise
                 return
+            
+            
+            
+            
+            #=======================================================
             # Compute performance as mean reward from the most recent transitions in FIFO buffer
             rewards = []
             # Try to get the most recent N rewards (N=100 for consistency with embedding)
@@ -293,20 +393,23 @@ class Runner:
                 except Exception:
                     # Fallback: sample N
                     batch = self.buffer_fifo.sample(N)
-                    rewards = batch["rewards"].flatten()
-                    
+                    rewards = batch["rewards"].flatten()      
             else:
                 # Use all available rewards
                 try:
                     rewards = [self.buffer_fifo.rewards[i][0] for i in range(len(self.buffer_fifo))]
                 except Exception:
                     batch = self.buffer_fifo.sample(len(self.buffer_fifo))
-                    rewards = batch["rewards"].flatten()
-                    
+                    rewards = batch["rewards"].flatten()        
                     
             print("rewards", rewards)
-            self.performance = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
-            logging.info(f"[share_and_receive] Computed performance: {self.performance} (mean reward from FIFO buffer, N={len(rewards)})")
+            print("current_success", current_success.float().mean().item() * 100.0)
+            self.performance = current_success.float().mean().item() * 100.0
+            logging.info(f"[share_and_receive] Computed performance: {self.performance} ")
+            
+            #===========================================================================================
+            
+            
         except Exception as e:
             logging.error(f"[share_and_receive] Exception before barrier: {e}", exc_info=True)
             if self.barrier:
@@ -317,184 +420,159 @@ class Runner:
             raise
 
         # --- FORCE SHARING/COMPOSITION FOR TESTING ---
+        # Optional: inject fake peers for local testing
         if getattr(self.args, "force_sharing_test", False):
-            
-            # Add a fake peer TEQ with high similarity and lower performance
-            peer_id = 1 if self.args.agent_id == 0 else 0
-            noise = torch.randn_like(self.task_embedding) * 0.01
-            peer_embedding = (self.task_embedding + noise).cpu().numpy()
+            # Injected peers are put into the shared TEQ list (for this episode)
+            test_peer_id = (self.args.agent_id + 1) % self.args.num_agents
+            noise = torch.from_numpy(np.random.randn(*self.task_embedding.shape).astype(np.float32)).to(self.task_embedding.device) * 0.01
+            peer_emb = (self.task_embedding + noise).cpu().numpy().astype(np.float32)
             peer_perf = max(self.performance - 0.5, 0.1)
-            if self.Q_emb is not None:
-                self.Q_emb.put((peer_id, peer_embedding, peer_perf, episode))
-            # Add a second peer with higher performance to test receiving
-            peer_id2 = 2 if self.args.agent_id == 0 else 0
-            peer_embedding2 = (self.task_embedding + noise * 2).cpu().numpy()
+            teq_list = self._ensure_episode_list(self.shared_teqs, episode)
+            teq_list.append((test_peer_id, peer_emb, peer_perf, episode))
+            # a higher-performing peer
+            test_peer_id2 = (self.args.agent_id + 2) % self.args.num_agents
+            peer_emb2 = (self.task_embedding + noise * 2).cpu().numpy().astype(np.float32)
             peer_perf2 = self.performance + 0.5
-            if self.Q_emb is not None:
-                self.Q_emb.put((peer_id2, peer_embedding2, peer_perf2, episode))
-            logging.info(f"[force_sharing_test] Injected fake peer TEQs for testing sharing/composition.")
+            teq_list.append((test_peer_id2, peer_emb2, peer_perf2, episode))
+            logging.info(f"[Agent {self.args.agent_id}] Injected fake peers for testing.")
 
-        # Share TEQ via shared list (include episode for filtering)
-        teq = (self.args.agent_id, self.task_embedding.cpu().numpy(), self.performance, episode)
-        if self.Q_emb is not None:
-            self.Q_emb.put(teq)
-        logging.info(f"[share_and_receive] Put TEQ to Q_emb: agent_id={self.args.agent_id}, embedding_shape={teq[1].shape}, performance={teq[2]}, episode={teq[3]}")
 
-        if self.barrier:
-            logging.debug("[share_and_receive] Waiting on TEQ barrier")
-            self.barrier.wait()
+        # --- SHARE TEQ: append to shared_teqs[episode] (broadcast) ---
+        teq = (self.args.agent_id, self.task_embedding.cpu().numpy().astype(np.float32), self.performance, episode)
+        teq_list = self._ensure_episode_list(self.shared_teqs, episode)
+        teq_list.append(teq)
+        logging.info(f"[Agent {self.args.agent_id}] Appended TEQ to shared_teqs for episode {episode}")
 
-        # Read all current TEQs (filter by episode to avoid stale data)
-        # Drain Q_emb and collect TEQs for this episode
-        current_teqs = []
-        if self.Q_emb is not None:
-            try:
-                while True:
-                    t = self.Q_emb.get_nowait()
-                    if t[3] == episode:
-                        current_teqs.append(t)
-            except Exception:
-                pass
-        logging.info(f"[share_and_receive] Read {len(current_teqs)} TEQs from Q_emb for episode {episode}")
+        # TEQ barrier: wait until all agents have appended TEQs
+        logging.debug(f"[Agent {self.args.agent_id}] Waiting on TEQ barrier")
+        self.barrier.wait()
+
+        # READ TEQs from the shared list (no draining; everyone reads the same snapshot)
+        current_teqs = list(self.shared_teqs.get(episode, []))
+        logging.info(f"[Agent {self.args.agent_id}] Read {len(current_teqs)} TEQs for episode {episode}")
+
         received_teqs = []
-        teq_count = 0
         peer_details = []
+
         for peer_id, peer_emb_np, peer_perf, _ in current_teqs:
+            # skip own TEQ
             if peer_id == self.args.agent_id:
-                logging.debug(f"[share_and_receive] Skipping own TEQ: peer_id={peer_id}")
                 continue
-            peer_emb = torch.tensor(peer_emb_np, device=self.device)
-            cos_sim = torch.cosine_similarity(self.task_embedding, peer_emb, dim=0)
-            is_similar = cos_sim.item() > self.args.sim_threshold
+
+            # compute cosine similarity (numpy)
+            # ensure both are normalized
+            def normalize(v):
+                if type(v) != np.ndarray:
+                    v = v.cpu().numpy()
+                n = np.linalg.norm(v) + 1e-10
+                return v / n
+
+
+            if self.task_embedding is None:
+                # if we somehow did not compute embedding yet, compute now
+                self.compute_task_embedding()
+
+            a = normalize(self.task_embedding)
+            print(peer_emb_np)
+            b = normalize(peer_emb_np)
+            cos_sim = float(np.dot(a, b))
+            is_similar = cos_sim > self.args.sim_threshold
             is_better = peer_perf > self.performance
+
             peer_details.append({
                 "peer_id": peer_id,
                 "peer_perf": peer_perf,
-                "cos_sim": cos_sim.item(),
+                "cos_sim": cos_sim,
                 "is_similar": is_similar,
                 "is_better": is_better
             })
-            logging.info(f"[share_and_receive] Processed peer {peer_id}: cosine_sim={cos_sim.item():.4f}, peer_perf={peer_perf}")
-            if is_similar:
-                received_teqs.append((peer_id, peer_emb, peer_perf))
-                logging.info(f"[share_and_receive] Added similar peer {peer_id} (sim > {self.args.sim_threshold})")
-            teq_count += 1
-        # Print peer summary table
-        if peer_details:
-            logging.info("[share_and_receive] Peer summary (id | perf | cos_sim | is_similar | is_better):")
-            for d in peer_details:
-                logging.info(f"  id={d['peer_id']} | perf={d['peer_perf']:.4f} | cos_sim={d['cos_sim']:.4f} | similar={d['is_similar']} | better={d['is_better']}")
-        else:
-            logging.info("[share_and_receive] No peers found for summary.")
-        logging.info(f"[share_and_receive] Processed {teq_count} peer TEQs, found {len(received_teqs)} similar peers")
 
-        # Send masks if better (append to shared list, include episode)
+            if is_similar:
+                received_teqs.append((peer_id, b, peer_perf))
+
+        if peer_details:
+            logging.info(f"[Agent {self.args.agent_id}] Peer summary: " +
+                         ", ".join([f"id={d['peer_id']} perf={d['peer_perf']:.3f} sim={d['cos_sim']:.3f}"
+                                    for d in peer_details]))
+        else:
+            logging.info(f"[Agent {self.args.agent_id}] No peers to summarize.")
+
+        # For similar peers that are worse, send masks (append to shared_masks[episode])
         serialized_lora = None
         sent_masks = 0
         for peer_id, _, peer_perf in received_teqs:
             if self.performance > peer_perf:
-                
-                logging.info(f"[share_and_receive] Better than peer {peer_id} (my_perf={self.performance} > peer_perf={peer_perf}); preparing to send mask")
-                
+                logging.info(f"[Agent {self.args.agent_id}] I am better than peer {peer_id} (sending mask).")
                 if serialized_lora is None:
                     sparse_lora = self.make_sparse_lora()
-                    logging.debug(f"[share_and_receive] Created sparse LoRA: num_params={len(sparse_lora)}, example_shape={sparse_lora[0].shape if sparse_lora else 'empty'}")
-                    serialized_lora = [p.detach().cpu().to(torch.float32).numpy() for p in sparse_lora]
-                    logging.debug(f"[share_and_receive] Serialized LoRA: num_arrays={len(serialized_lora)}")
-                
-                mask_data = (self.args.agent_id, serialized_lora, episode)
-                if self.Q_mask is not None:
-                    self.Q_mask.put(mask_data)
-                
+                    serialized_lora = [p.cpu().numpy().astype(np.float32) for p in sparse_lora]
+                mask_list = self._ensure_episode_list(self.shared_masks, episode)
+                mask_list.append((self.args.agent_id, serialized_lora, episode))
                 sent_masks += 1
-                logging.info(f"[share_and_receive] Appended mask to mask_list for peer {peer_id}")
 
-        logging.info(f"[share_and_receive] Sent {sent_masks} masks in total")
+        logging.info(f"[Agent {self.args.agent_id}] Sent {sent_masks} masks for episode {episode}")
 
-        if self.barrier:
-            logging.debug("[share_and_receive] Waiting on mask barrier")
-            try:
-                self.barrier.wait(timeout=60)
-            except Exception as e:
-                logging.error(f"[share_and_receive] Barrier wait failed: {e}", exc_info=True)
-                # Optionally, abort the barrier to unblock others
-                try:
-                    self.barrier.abort()
-                except Exception as be:
-                    logging.error(f"[share_and_receive] Failed to abort barrier: {be}", exc_info=True)
-                raise
+        # Mask barrier: wait until all agents have appended masks (or not)
+        logging.debug(f"[Agent {self.args.agent_id}] Waiting on mask barrier")
+        self.barrier.wait()
 
-        # Read all current masks
-        # Drain Q_mask and collect masks for this episode
-        current_masks = []
-        if self.Q_mask is not None:
-            try:
-                while True:
-                    m = self.Q_mask.get_nowait()
-                    if m[2] == episode:
-                        current_masks.append(m)
-            except Exception:
-                pass
-        logging.info(f"[share_and_receive] Read {len(current_masks)} masks from Q_mask for episode {episode}")
-        
+        # READ masks (everyone reads the same list)
+        current_masks = list(self.shared_masks.get(episode, []))
+        logging.info(f"[Agent {self.args.agent_id}] Read {len(current_masks)} masks for episode {episode}")
+
+        # Accept masks only from better peers
         better_peer_ids = [p_id for p_id, _, p_perf in received_teqs if p_perf > self.performance]
-        logging.info(f"[share_and_receive] Identified better peers: {better_peer_ids}")
-        
+        logging.info(f"[Agent {self.args.agent_id}] Better peer ids (eligible senders): {better_peer_ids}")
+
         self.received_masks = {}
-        mask_count = len(current_masks)
-        
         for sender_id, peer_lora_ser, _ in current_masks:
             if sender_id in better_peer_ids:
-                logging.info(f"[share_and_receive] Accepting mask from better peer {sender_id}")
-                peer_lora = [torch.tensor(p, device=self.device) for p in peer_lora_ser]
-                logging.debug(f"[share_and_receive] Deserialized peer LoRA: num_tensors={len(peer_lora)}, example_shape={peer_lora[0].shape if peer_lora else 'empty'}")
+                # deserialize (they are numpy arrays already)
+                peer_lora = [np.array(p, dtype=np.float32) for p in peer_lora_ser]
                 self.received_masks[sender_id] = peer_lora
+                logging.info(f"[Agent {self.args.agent_id}] Accepted mask from {sender_id}")
             else:
-                logging.debug(f"[share_and_receive] Ignoring mask from non-better peer {sender_id}")
-        logging.info(f"[share_and_receive] Total masks in list: {mask_count}, received and stored {len(self.received_masks)}")
+                logging.debug(f"[Agent {self.args.agent_id}] Ignored mask from non-better sender {sender_id}")
 
-        # Update beta weights
+        # Update beta weights using self.performance and accepted peers' performances
         peer_id_to_perf = {p_id: p_perf for p_id, _, p_perf in received_teqs}
-        logging.debug(f"[share_and_receive] Peer performance map: {peer_id_to_perf}")
         total_perf = self.performance
         for peer_id in self.received_masks:
-            peer_perf = peer_id_to_perf.get(peer_id, 0)
-            total_perf += peer_perf
-            logging.debug(f"[share_and_receive] Adding perf from peer {peer_id}: {peer_perf}")
-        logging.info(f"[share_and_receive] Calculated total_perf={total_perf}")
+            total_perf += peer_id_to_perf.get(peer_id, 0.0)
+        logging.info(f"[Agent {self.args.agent_id}] Calculated total_perf = {total_perf:.6f}")
+
         if total_perf > 0:
-            self.beta_weights[self.task_idx] = self.performance / (total_perf + 1e-6)
-            logging.info(f"[share_and_receive] Updated self beta_weight (idx {self.task_idx}): {self.beta_weights[self.task_idx]}")
+            # reset weights to zero
+            if isinstance(self.beta_weights, np.ndarray):
+                self.beta_weights.fill(0.0)
+            else:  # assume list
+                self.beta_weights = [0.0] * len(self.beta_weights)
+            self.beta_weights[self.task_idx] = self.performance / (total_perf + 1e-12)
             for peer_id in self.received_masks:
-                peer_idx = peer_id  # Assuming sequential assignment
-                self.beta_weights[peer_idx] = peer_id_to_perf[peer_id] / (total_perf + 1e-6)
-                logging.info(f"[share_and_receive] Updated beta_weight for peer {peer_id} (idx {peer_idx}): {self.beta_weights[peer_idx]}")
+                self.beta_weights[peer_id] = peer_id_to_perf.get(peer_id, 0.0) / (total_perf + 1e-12)
         else:
-            logging.warning("[share_and_receive] Total performance <= 0; beta_weights unchanged")
-        logging.info(f"[share_and_receive] Final beta_weights: {self.beta_weights}")
+            logging.warning(f"[Agent {self.args.agent_id}] Total perf <= 0; beta_weights unchanged.")
 
-        logging.info("[share_and_receive] Starting policy composition")
+        logging.info(f"[Agent {self.args.agent_id}] Beta weights updated: {self.beta_weights}]")
+
+        # Compose policy using new weights and masks
+        logging.info(f"[Agent {self.args.agent_id}] Starting policy composition")
         self.compose_policy()
-        logging.info("[share_and_receive] Composed policy with new beta_weights and received masks")
+        logging.info(f"[Agent {self.args.agent_id}] Finished composition")
 
-        # Clear lists safely (extra barrier, then leader clears)
-        if self.barrier:
-            logging.debug("[share_and_receive] Waiting on clear barrier")
-            try:
-                self.barrier.wait(timeout=60)
-            except Exception as e:
-                logging.error("[share_and_receive] Barrier wait (final clear phase) failed: %s", e, exc_info=True)
-                try:
-                    self.barrier.abort()
-                except Exception as be:
-                    logging.error("[share_and_receive] Failed to abort barrier (final clear phase): %s", be, exc_info=True)
-                raise
-            if self.args.agent_id == 0:
-                # No need to clear queues; they are drained each round
-                logging.info("[share_and_receive] Leader: queues are used for communication, no explicit clear needed")
-            else:
-                logging.debug("[share_and_receive] Non-leader waiting for clear")
+        # Final clear barrier: leader deletes per-episode lists to avoid memory growth
+        logging.debug(f"[Agent {self.args.agent_id}] Waiting on final clear barrier")
+        self.barrier.wait()
+        if self.args.agent_id == 0:
+            # Leader: cleanup
+            if episode in self.shared_teqs:
+                del self.shared_teqs[episode]
+            if episode in self.shared_masks:
+                del self.shared_masks[episode]
+            logging.info(f"[Agent {self.args.agent_id}] Leader cleared shared lists for episode {episode}")
 
+
+        
     @torch.no_grad()
     def _get_action(self, obs, deterministic=False):
         total_batch = obs["image"].shape[0]
@@ -521,15 +599,16 @@ class Runner:
 
     def insert(self, data):
         #.cpu creates a copy in cpu so that numpy can convert it to numpy which is liter to be stored in buffer
-        obs_img, actions, logprob, value_preds, rewards, done = data
+        obs_img, actions, logprob, value_preds, rewards, success, done = data #obs_img, actions, logprob, value_preds, rewards, done = data
         masks = 1.0 - done.to(torch.float32)
         obs_img_np = obs_img.cpu().numpy()
         actions_np = actions.to(torch.int32).cpu().numpy()
         logprob_np = logprob.to(torch.float32).cpu().numpy()
         value_preds_np = value_preds.to(torch.float32).cpu().numpy()
         rewards_np = rewards.cpu().numpy()
-        masks_np = masks.cpu().numpy()
         
+        masks_np = masks.cpu().numpy()
+       
         self.buffer.insert(obs_img_np, actions_np, logprob_np, value_preds_np, rewards_np, masks_np)
         
         # Insert into buffer_fifo for embedding/similarity
@@ -676,10 +755,11 @@ class Runner:
             for _ in tqdm(range(self.args.episode_len), desc="rollout"):
                 value, action, logprob = self.collect()
                 obs_img, reward, done, env_info = self.env.step(action)
+                success = env_info["success"]              # e.g., array([True, False, True])
                 
-                print(reward, "stepdata")
                 
-                data = (obs_img, action, logprob, value, reward, done)
+                
+                data = (obs_img, action, logprob, value, reward, success, done)
                 
                 self.insert(data)
                 
@@ -694,7 +774,7 @@ class Runner:
             del value, action, logprob, obs_img, reward, done
             
             # MOSAIC: Share and receive masks and compute embeddings
-            #self.share_and_receive(episode)
+            self.share_and_receive(episode, current_success=success)
             
             infos = self.train()
             

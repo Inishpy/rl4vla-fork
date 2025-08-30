@@ -30,7 +30,6 @@ ENVIRONMENTS = [
     "PutSpoonOnTableClothInScene-v1",
     "StackGreenCubeOnYellowCubeBakedTexInScene-v1",
     "PutEggplantInBasketScene-v1",
-    "PutOnPlateInScene25Single-v1",
     "PutOnPlateInScene25Main-v3",
     "PutOnPlateInScene25VisionImage-v1",
     "PutOnPlateInScene25VisionTexture03-v1",
@@ -47,7 +46,7 @@ def parse_args():
     args, unknown = parser.parse_known_args()
     return args, unknown
 
-def worker(cli_args, cuda_device, q_emb, q_mask, barrier):
+def worker(cli_args, cuda_device, q_emb, q_mask, barrier, manager):
     os.environ["CUDA_VISIBLE_DEVICES"] = cuda_device
     sys.argv = ["train_ms3_ppo.py"] + cli_args
     
@@ -73,7 +72,7 @@ def worker(cli_args, cuda_device, q_emb, q_mask, barrier):
     )
     logging.info("Logging started. Log file: %s", log_file)
     
-    runner = Runner(args, train_xlsx, test_xlsx, q_emb, q_mask, barrier)
+    runner = Runner(args, train_xlsx, test_xlsx, q_emb, q_mask, barrier, manager)
     print("test")
     if args.only_render:
         ll = [
@@ -112,6 +111,10 @@ def main():
     Q_emb = manager.Queue() if args.comm_interval > 0 else None
     Q_mask = manager.Queue() if args.comm_interval > 0 else None
     barrier = manager.Barrier(args.num_agents) if args.comm_interval > 0 else None
+    from multiprocessing import Manager
+    manager = Manager()
+    shared_teqs = manager.dict()   # episode -> manager.list()
+    shared_masks = manager.dict()  # episode -> manager.list()
 
     procs = []
     for i in range(args.num_agents):
@@ -129,7 +132,7 @@ def main():
            
         ] + unknown
         print(f"Launching agent {i}: name={agent_name}, seed={agent_seed}, env_id={env_id}, CUDA_VISIBLE_DEVICES={device}")
-        proc = mp.Process(target=worker, args=(agent_cli_args, device, Q_emb, Q_mask, barrier))
+        proc = mp.Process(target=worker, args=(agent_cli_args, device, shared_teqs, shared_masks, barrier, manager))
         proc.start()
         procs.append(proc)
 
