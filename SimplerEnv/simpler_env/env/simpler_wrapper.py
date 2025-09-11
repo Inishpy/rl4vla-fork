@@ -26,6 +26,7 @@ class SimlerWrapper:
             sensor_configs={"shader_pack": "default"},
         )
         self.env: BaseEnv = gym.make(**env_config)
+        
         self.env.reset(seed=[self.args.seed * 1000 + i + extra_seed for i in range(self.args.num_envs)])
 
         # variables
