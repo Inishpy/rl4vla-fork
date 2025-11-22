@@ -14,7 +14,10 @@ def communicate(self, episode, current_success, timeout=60.0):
             return
 
         # Communication interval check
+        logging.info(str(episode))
+        logging.info(str(self.args.comm_interval))
         if episode % self.args.comm_interval != 0:
+            
             logging.info("[share_and_receive] Not a communication interval; returning early")
             return
         logging.info(f"[share_and_receive] Communication interval hit (comm_interval={self.args.comm_interval})")
@@ -25,23 +28,23 @@ def communicate(self, episode, current_success, timeout=60.0):
             return
 
         # --- Compute performance as mean success (keeps your previous logic) ---
-        rewards = []
-        N = 100
-        try:
-            if len(self.buffer_fifo) >= N:
-                rewards = [self.buffer_fifo.rewards[(self.buffer_fifo.ptr - i - 1) % self.buffer_fifo.capacity][0] for i in range(N)]
-            else:
-                rewards = [self.buffer_fifo.rewards[i][0] for i in range(len(self.buffer_fifo))]
-        except Exception:
-            try:
-                if len(self.buffer_fifo) >= N:
-                    batch = self.buffer_fifo.sample(N)
-                else:
-                    batch = self.buffer_fifo.sample(len(self.buffer_fifo))
-                rewards = batch["rewards"].flatten()
-            except Exception as e:
-                logging.debug(f"[share_and_receive] Couldn't extract rewards from buffer: {e}")
-                rewards = []
+        # rewards = []
+        # N = 100
+        # try:
+        #     if len(self.buffer_fifo) >= N:
+        #         rewards = [self.buffer_fifo.rewards[(self.buffer_fifo.ptr - i - 1) % self.buffer_fifo.capacity][0] for i in range(N)]
+        #     else:
+        #         rewards = [self.buffer_fifo.rewards[i][0] for i in range(len(self.buffer_fifo))]
+        # except Exception:
+        #     try:
+        #         if len(self.buffer_fifo) >= N:
+        #             batch = self.buffer_fifo.sample(N)
+        #         else:
+        #             batch = self.buffer_fifo.sample(len(self.buffer_fifo))
+        #         rewards = batch["rewards"].flatten()
+        #     except Exception as e:
+        #         logging.debug(f"[share_and_receive] Couldn't extract rewards from buffer: {e}")
+        #         rewards = []
 
         # performance based on current_success as before
         try:
@@ -137,9 +140,9 @@ def communicate(self, episode, current_success, timeout=60.0):
         except Exception as e:
             logging.error(f"[share_and_receive] Error reading q_mask: {e}", exc_info=True)
             time.sleep(0.1)
-
+    print("received")
     logging.info(f"[share_and_receive] Collected {len(received_items)} masks from peers")
-
+    print("receivecd")
     # --- Accept and store received masks ---
     self.received_masks = {}   # mapping peer_id -> deserialized mask (list of numpy arrays)
     peer_id_to_perf = {}
@@ -148,6 +151,7 @@ def communicate(self, episode, current_success, timeout=60.0):
     received_from_strs = []
     for peer_id, peer_perf, peer_mask_ser in received_items:
         try:
+            print(peer_id, peer_perf, peer_mask_ser, "debug")    
             # peer_mask_ser is already a list of numpy arrays (float32) from comm module
             peer_lora = [np.array(p, dtype=np.float32) for p in peer_mask_ser]
             self.received_masks[peer_id] = peer_lora
@@ -155,21 +159,26 @@ def communicate(self, episode, current_success, timeout=60.0):
             received_from_ids.append(peer_id)
             received_from_strs.append(f"agent {peer_id} (perf={peer_perf:.3f})")
             logging.info(f"[share_and_receive] Agent {receiver_id} accepted mask from agent {peer_id} (perf={peer_perf:.3f})")
+            # Update lora_received_mask in policy for this peer
+            if hasattr(self, "policy") and hasattr(self.policy, "update_lora_received_mask"):
+                # Map peer_id to environment index if needed
+                env_idx = peer_id if peer_id < len(self.policy.lora_received_mask) else 0
+                self.policy.update_lora_received_mask(env_idx)
         except Exception as e:
             logging.warning(f"[share_and_receive] Failed to deserialize mask from {peer_id}: {e}", exc_info=True)
-
+    print("receivecd")
     # --- Set beta=0.01 for any new peer, then normalize so sum=1 ---
     for peer_id in received_from_ids:
         # Extend beta_weights if needed
-        if peer_id >= len(self.beta_weights):
-            self.beta_weights += [0.0] * (peer_id - len(self.beta_weights) + 1)
+        if peer_id >= len(self.policy.beta_weights):
+            self.policy.beta_weights += [0.0] * (peer_id - len(self.policy.beta_weights) + 1)
         # If this peer is new (beta was 0), set to 0.01
-        if self.beta_weights[peer_id] == 0.0:
-            self.beta_weights[peer_id] = 0.01
+        if self.policy.beta_weights[peer_id] == 0.0:
+            self.policy.beta_weights[peer_id] = 0.01
     # Normalize so sum is 1 (including own and all peers)
-    total = sum(self.beta_weights)
+    total = sum(self.policy.beta_weights)
     if total > 0:
-        self.beta_weights = [b / total for b in self.beta_weights]
+        self.policy.beta_weights = [b / total for b in self.policy.beta_weights]
     if received_from_ids:
         logging.info(f"[share_and_receive] Agent {receiver_id} received masks from agents: {received_from_ids} before composing.")
     else:
@@ -181,6 +190,7 @@ def communicate(self, episode, current_success, timeout=60.0):
         "episode": episode,
         "received_from": ", ".join(received_from_strs) if received_from_strs else "no masks received"
     }
+    print("receivecd")
     for xlsx_path in [getattr(self, "train_xlsx", None), getattr(self, "test_xlsx", None)]:
         if xlsx_path is not None:
             try:
@@ -201,21 +211,21 @@ def communicate(self, episode, current_success, timeout=60.0):
 
         if total_perf > 0:
             # Reset weights (keep same length)
-            if isinstance(self.beta_weights, np.ndarray):
-                self.beta_weights.fill(0.0)
+            if isinstance(self.policy.beta_weights, np.ndarray):
+                self.policy.beta_weights.fill(0.0)
             else:
-                self.beta_weights = [0.0] * len(self.beta_weights)
+                self.policy.beta_weights = [0.0] * len(self.policy.beta_weights)
             # set own weight keyed by task_idx (as before)
-            self.beta_weights[self.task_idx] = float(self.performance) / (total_perf + 1e-12)
+            self.policy.beta_weights[self.task_idx] = float(self.performance) / (total_perf + 1e-12)
             for peer_id in self.received_masks:
                 # peer_id should map to an index in beta_weights; original used peer_id directly
-                if peer_id < len(self.beta_weights):
-                    self.beta_weights[peer_id] = peer_id_to_perf.get(peer_id, 0.0) / (total_perf + 1e-12)
+                if peer_id < len(self.policy.beta_weights):
+                    self.policy.beta_weights[peer_id] = peer_id_to_perf.get(peer_id, 0.0) / (total_perf + 1e-12)
                 else:
-                    logging.debug(f"[share_and_receive] Peer id {peer_id} outside beta_weights length ({len(self.beta_weights)})")
+                    logging.debug(f"[share_and_receive] Peer id {peer_id} outside beta_weights length ({len(self.policy.beta_weights)})")
         else:
             logging.warning("[share_and_receive] total_perf <= 0; leaving beta_weights unchanged.")
-        logging.info(f"[share_and_receive] Beta weights updated: {self.beta_weights}")
+        logging.info(f"[share_and_receive] Beta weights updated: {self.policy.beta_weights}")
     except Exception as e:
         logging.error(f"[share_and_receive] Error updating beta_weights: {e}", exc_info=True)
 

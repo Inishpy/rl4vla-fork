@@ -26,6 +26,23 @@ class OpenVLAPolicy:
         self.tpdv_vn = dict(device=torch.device("cuda:" + str(device_id)), dtype=torch.float32)
         self.action_scale = 1.0
 
+        # --- Beta weights as trainable parameter ---
+        # Determine number of environments
+        if hasattr(self.args, "all_envs") and self.args.all_envs:
+            self.env_list = self.args.all_envs.split(",")
+        else:
+            self.env_list = [self.args.env_id]
+        num_envs = len(self.env_list)
+        # Initialize: own mask weight=1, others=0
+        beta_init = torch.zeros(num_envs, dtype=torch.float32)
+        beta_init[self.args.agent_id] = 1.0
+        self.beta_weights = nn.Parameter(beta_init)
+
+        # Track which environments have received LoRA modules
+        # True for own env, False for others initially
+        self.lora_received_mask = torch.zeros(num_envs, dtype=torch.bool)
+        self.lora_received_mask[self.args.agent_id] = True
+
         # openvla: register
         self.image_processor = PrismaticImageProcessor.from_pretrained(self.args.vla_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.vla_path, trust_remote_code=True, padding_side="left")
@@ -47,6 +64,8 @@ class OpenVLAPolicy:
         )
 
         # openvla: lora
+        # Instead of a single LoRA adapter, create one per environment
+        self.lora_adapters = nn.ModuleList()
         if not self.args.vla_load_path:
             lora_config = LoraConfig(
                 r=self.args.vla_lora_rank,
@@ -59,8 +78,25 @@ class OpenVLAPolicy:
                 ],
                 init_lora_weights="gaussian"
             )
-            self.vla = get_peft_model(self.vla, lora_config)
+            for _ in range(num_envs):
+                # Each adapter is a separate PEFT model on a copy of the base model
+                # (Assume get_peft_model returns a model with LoRA injected)
+                adapter = get_peft_model(
+                    OpenVLAForActionPredictionWithValueHead.from_pretrained(
+                        self.args.vla_path,
+                        attn_implementation="flash_attention_2",
+                        torch_dtype=torch.bfloat16,
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True,
+                        device_map="cuda:" + str(self.device_id),
+                        vh_mode="a0",
+                    ),
+                    lora_config
+                )
+                self.lora_adapters.append(adapter)
+            # The main self.vla remains the base model (without LoRA)
         else:
+            # If loading from checkpoint, fallback to original logic for now
             self.vla = PeftModel.from_pretrained(self.vla, self.args.vla_load_path, is_trainable=True)
             print(f"VLA load: {self.args.vla_load_path}")
 
@@ -74,7 +110,7 @@ class OpenVLAPolicy:
             if "value_head" in name:
                 param.requires_grad = True
 
-        self.vla.print_trainable_parameters()
+        # self.vla.print_trainable_parameters()
 
         # openvla: optimizer
         self.params_vh = None
@@ -101,9 +137,61 @@ class OpenVLAPolicy:
             else:
                 print(f"Warning: training_state not found in {training_state_path}")
 
+    def forward_with_beta_lora(self, features, *args, **kwargs):
+        """
+        Forward pass that linearly combines the outputs of all LoRA adapters using beta_weights.
+        Assumes self.vla is the base model (without LoRA), and self.lora_adapters is a ModuleList of LoRA models.
+        """
+        # If no lora_adapters, just use the loaded model directly (single LoRA or base)
+        if not hasattr(self, "lora_adapters") or len(self.lora_adapters) == 0:
+            return self.vla.predict_action_batch(
+                **features,
+                unnorm_key=self.args.vla_unnorm_key,
+                do_sample=kwargs.get("do_sample", False),
+                temperature=kwargs.get("temperature", 1.0),
+            )
+        # Get base model output
+        base_out = self.vla.predict_action_batch(
+            **features,
+            unnorm_key=self.args.vla_unnorm_key,
+            do_sample=kwargs.get("do_sample", False),
+            temperature=kwargs.get("temperature", 1.0),
+        )
+        # Each LoRA adapter: run forward, subtract base to get delta, then combine
+        deltas = []
+        for adapter in self.lora_adapters:
+            lora_out = adapter.predict_action_batch(
+                **features,
+                unnorm_key=self.args.vla_unnorm_key,
+                do_sample=kwargs.get("do_sample", False),
+                temperature=kwargs.get("temperature", 1.0),
+            )
+            # Each output is (values, action, logprobs)
+            # Subtract base model output to get delta for each output
+            lora_delta = tuple(lo - bo for lo, bo in zip(lora_out, base_out))
+            deltas.append(lora_delta)
+        # Stack and combine deltas using beta_weights
+        # Each element in deltas is a tuple (values, action, logprobs)
+        # We combine each output type separately
+
+        # Mask out beta logits for environments with no LoRA
+        beta_logits = self.beta_weights.clone()
+        mask = self.lora_received_mask.to(beta_logits.dtype)
+        beta_logits[mask == 0] = float('-inf')
+        beta = torch.softmax(beta_logits, dim=0)
+
+        combined = []
+        for i in range(len(base_out)):
+            stacked = torch.stack([d[i] for d in deltas], dim=0)  # [num_envs, ...]
+            beta = beta.to(stacked.device)
+            combined_delta = (beta.view(-1, *([1] * (stacked.dim() - 1))) * stacked).sum(dim=0)
+            combined.append(base_out[i] + combined_delta)
+        return tuple(combined)
     def _setup_optimizer(self):
         self.params_vh = [p for n, p in self.vla.named_parameters() if "value_head" in n and p.requires_grad]
+        # Add beta_weights to params_vla
         self.params_vla = [p for n, p in self.vla.named_parameters() if "value_head" not in n and p.requires_grad]
+        self.params_vla.append(self.beta_weights)
         betas = (self.args.vla_optim_beta1, self.args.vla_optim_beta2)
         self.vh_optimizer = AdamW(self.params_vh, lr=self.args.vla_vhlr, betas=betas)
         self.vla_optimizer = AdamW(self.params_vla, lr=self.args.vla_lr, betas=betas)
@@ -149,9 +237,9 @@ class OpenVLAPolicy:
         do_sample = (temperature != 0.0)
         features = self._preprocess_obs(x)
 
-        values, action, logprobs = self.vla.predict_action_batch(
-            **features,
-            unnorm_key=self.args.vla_unnorm_key,
+        # Use the beta-weighted LoRA combination
+        values, action, logprobs = self.forward_with_beta_lora(
+            features,
             do_sample=do_sample,
             temperature=temperature,
         )
@@ -181,7 +269,27 @@ class OpenVLAPolicy:
     def get_value(self, x: dict) -> torch.Tensor:
         features = self._preprocess_obs(x)
 
-        value = self.vla.get_value(**features)
+        # If no lora_adapters, just use the loaded model directly
+        if not hasattr(self, "lora_adapters") or len(self.lora_adapters) == 0:
+            value = self.vla.get_value(**features)
+            assert len(value.shape) == 2 and value.shape[1] == 1
+            return value
+
+        # Use the beta-weighted LoRA combination for value prediction
+        base_value = self.vla.get_value(**features)
+        deltas = []
+        for adapter in self.lora_adapters:
+            lora_value = adapter.get_value(**features)
+            lora_delta = lora_value - base_value
+            deltas.append(lora_delta)
+        # Mask out beta logits for environments with no LoRA
+        beta_logits = self.beta_weights.clone()
+        mask = self.lora_received_mask.to(beta_logits.dtype)
+        beta_logits[mask == 0] = float('-inf')
+        beta = torch.softmax(beta_logits, dim=0)
+        stacked = torch.stack(deltas, dim=0)
+        combined_delta = (beta.view(-1, *([1] * (stacked.dim() - 1))) * stacked).sum(dim=0)
+        value = base_value + combined_delta
 
         assert len(value.shape) == 2 and value.shape[1] == 1
 
@@ -197,10 +305,44 @@ class OpenVLAPolicy:
     def evaluate_actions(self, x: dict, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         features = self._preprocess_obs(x, action)
 
-        logprobs, entropy, values = self.vla.evaluate_action(
+        # If no lora_adapters, just use the loaded model directly
+        if not hasattr(self, "lora_adapters") or len(self.lora_adapters) == 0:
+            base_out = self.vla.evaluate_action(
+                **features,
+                unnorm_key=self.args.vla_unnorm_key
+            )
+            logprobs, entropy, values = base_out
+            assert len(logprobs.shape) == 2 and logprobs.shape[1] == 1
+            assert len(entropy.shape) == 2 and entropy.shape[1] == 1
+            assert len(values.shape) == 2 and values.shape[1] == 1
+            return logprobs, entropy, values
+
+        # Use the beta-weighted LoRA combination for evaluation
+        base_out = self.vla.evaluate_action(
             **features,
             unnorm_key=self.args.vla_unnorm_key
         )
+        deltas = []
+        for adapter in self.lora_adapters:
+            lora_out = adapter.evaluate_action(
+                **features,
+                unnorm_key=self.args.vla_unnorm_key
+            )
+            lora_delta = tuple(lo - bo for lo, bo in zip(lora_out, base_out))
+            deltas.append(lora_delta)
+        # Mask out beta logits for environments with no LoRA
+        beta_logits = self.beta_weights.clone()
+        mask = self.lora_received_mask.to(beta_logits.dtype)
+        beta_logits[mask == 0] = float('-inf')
+        beta = torch.softmax(beta_logits, dim=0)
+        combined = []
+        for i in range(len(base_out)):
+            stacked = torch.stack([d[i] for d in deltas], dim=0)
+            beta = beta.to(stacked.device)
+            combined_delta = (beta.view(-1, *([1] * (stacked.dim() - 1))) * stacked).sum(dim=0)
+            combined.append(base_out[i] + combined_delta)
+
+        logprobs, entropy, values = combined
 
         assert len(logprobs.shape) == 2 and logprobs.shape[1] == 1
         assert len(entropy.shape) == 2 and entropy.shape[1] == 1
@@ -258,6 +400,66 @@ class OpenVLAPolicy:
         self._setup_optimizer()
         self.vh_optimizer.load_state_dict(training_state['vh_optimizer'])
         self.vla_optimizer.load_state_dict(training_state['vla_optimizer'])
+
+    def update_lora_received_mask(self, env_idx):
+        """
+        Mark that a LoRA module has been received for the given environment index.
+        """
+        self.lora_received_mask[env_idx] = True
+
+    def consolidate_lora(self):
+        """
+        Consolidate the current linear combination of LoRA adapters into a single LoRA,
+        replace all adapters with this one, and reset the mask so only the current environment is active.
+        """
+        # Only consolidate if there are multiple adapters and more than one is active
+        if self.lora_adapters is None or len(self.lora_adapters) == 0:
+            return
+
+        # Use the current beta-masked combination to create a new LoRA adapter
+        # For simplicity, take the weighted sum of all LoRA parameters
+        with torch.no_grad():
+            # Assume all adapters have the same structure
+            new_adapter = get_peft_model(
+                OpenVLAForActionPredictionWithValueHead.from_pretrained(
+                    self.args.vla_path,
+                    attn_implementation="flash_attention_2",
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                    device_map="cuda:" + str(self.device_id),
+                    vh_mode="a0",
+                ),
+                LoraConfig(
+                    r=self.args.vla_lora_rank,
+                    lora_alpha=min(self.args.vla_lora_rank, 16),
+                    lora_dropout=0.0,
+                    target_modules=[
+                        "proj", "qkv", "fc1", "fc2",  # vision
+                        "q", "kv", "fc3",  # project
+                        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head",  # llm
+                    ],
+                    init_lora_weights="gaussian"
+                )
+            )
+            # Weighted sum of LoRA parameters
+            beta_logits = self.beta_weights.clone()
+            mask = self.lora_received_mask.to(beta_logits.dtype)
+            beta_logits[mask == 0] = float('-inf')
+            beta = torch.softmax(beta_logits, dim=0)
+            # For each parameter in the LoRA adapter
+            for name, param in new_adapter.named_parameters():
+                if "lora" in name:
+                    # Weighted sum across all adapters
+                    stacked = torch.stack([a.state_dict()[name] for a in self.lora_adapters], dim=0)
+                    param.data.copy_((beta.view(-1, *([1] * (stacked.dim() - 1))) * stacked).sum(dim=0))
+            # Replace all adapters with the new one
+            self.lora_adapters = nn.ModuleList([new_adapter])
+            # Reset beta_weights and lora_received_mask: only current env is active
+            self.beta_weights.data.zero_()
+            self.beta_weights.data[0] = 1.0
+            self.lora_received_mask.zero_()
+            self.lora_received_mask[0] = True
 
 class OpenVLAPPO:
     def __init__(self, all_args, policy: OpenVLAPolicy):

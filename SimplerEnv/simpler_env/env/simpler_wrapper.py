@@ -56,7 +56,8 @@ class SimlerWrapper:
         pact_token = raw_actions.cpu().numpy()  # [B, dim]
         dact = 32000 - pact_token  # [B, dim]
         dact = np.clip(dact - 1, a_min=0, a_max=254)  # [B, dim]
-        normalized_actions = np.asarray([self.bin_centers[da] for da in dact])  # [B, dim]
+        dact = dact.astype(int)  # Ensure indices are integers
+        normalized_actions = self.bin_centers[dact]  # [B, dim]
 
         # Unnormalize actions
         action_norm_stats = self.unnorm_state

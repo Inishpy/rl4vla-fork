@@ -64,12 +64,12 @@ class Args:
     seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 0
     name: str = "MOSAIC-test"
     
-    num_envs: int = 16
-    episode_len: int = 80
+    num_envs: int = 3
+    episode_len: int = 8
     use_same_init: bool = False
     steps_max: int = 2000000
     steps_vh: int = 0
-    interval_eval: int = 2
+    interval_eval: int = 5
     interval_save: int = 40
     buffer_inferbatch: int = 4  #for rollout just pass chunks of env data to save memory
     buffer_minibatch: int = 2   #for training just pass chunks of stored buffer samples to save memory  
@@ -96,8 +96,8 @@ class Args:
     num_eval_runs: int = 1
     # MOSAIC-specific args
     force_sharing_test: bool = False
-    comm_interval: int = 3
-    comm_start: int = 7
+    comm_interval: int = 1
+    comm_start: int = 0
     agent_id: int = 0
     all_envs: str = ""
     
@@ -159,7 +159,7 @@ class Runner:
         
         self.sparse_lora = None  # Cache sparse LoRA
         self.composed_params = None  # Cache composed LoRA
-        # self.beta_weights is now handled as a trainable parameter in the policy
+        # self.beta_weights is now in self.policy.beta_weights (trainable)
 
         self.alg = OpenVLAPPO(all_args, self.policy)
         unnorm_state = self.policy.vla.get_action_stats(self.args.vla_unnorm_key)
@@ -225,11 +225,11 @@ class Runner:
         obs_array = np.array(obs, dtype=object)  # numpy array of images
 
         # Create temporary files to pass input/output
-        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as tmp_in, \
-            tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as tmp_out:
-            input_path = Path(tmp_in.name)
-            output_path = Path(tmp_out.name)
-            np.save(input_path, obs_array)
+        # with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as tmp_in, \
+        #     tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as tmp_out:
+        #     input_path = Path(tmp_in.name)
+        #     output_path = Path(tmp_out.name)
+        #     np.save(input_path, obs_array)
 
         # Run the worker script in a subprocess
         # You can activate a specific environment using conda run or your Python path
@@ -401,7 +401,7 @@ class Runner:
         """Compose policy with own and peer LoRA masks."""
         own_lora = self.make_sparse_lora()
         composed = []
-        # Use beta_weights from policy (trainable tensor)
+        # Use trainable beta_weights from policy
         beta_weights = self.policy.beta_weights
         for i, param in enumerate(own_lora):
             weighted_sum = param * beta_weights[self.task_idx]
@@ -416,6 +416,9 @@ class Runner:
             if param.requires_grad:
                 param.data.copy_(self.composed_params[lora_idx])
                 lora_idx += 1
+
+        # After composing, consolidate the linear combination into a single LoRA and reset
+        self.policy.consolidate_lora()
                 
                 
     # --- Utilities for safe append to manager dict of lists ---
@@ -661,18 +664,18 @@ class Runner:
                     for k, v in env_info["episode"].items():
                         env_infos[f"{k}"] += v
 
-            # --- Save policy checkpoint for parameter drift ---
-            try:
-                from safetensors.torch import save_file as safetensors_save_file
-                # Compose parameter drift directory path
-                print("drift_dir:", self.param_drift_dir)
-                drift_dir = self.param_drift_dir
-                drift_dir.mkdir(parents=True, exist_ok=True)
-                drift_path = drift_dir / f"policy_agent_{self.args.agent_id}_ep_{episode}.safetensors"
-                safetensors_save_file(self.policy.vla.state_dict(), str(drift_path))
-                print(f"[Runner] Saved parameter drift checkpoint: {drift_path}")
-            except Exception as e:
-                print(f"[Runner] Failed to save parameter drift checkpoint: {e}")
+            # --- Save policy checkpoint for parameter drift visualization---
+            # try:
+            #     from safetensors.torch import save_file as safetensors_save_file
+            #     # Compose parameter drift directory path
+            #     print("drift_dir:", self.param_drift_dir)
+            #     drift_dir = self.param_drift_dir
+            #     drift_dir.mkdir(parents=True, exist_ok=True)
+            #     drift_path = drift_dir / f"policy_agent_{self.args.agent_id}_ep_{episode}.safetensors"
+            #     safetensors_save_file(self.policy.vla.state_dict(), str(drift_path))
+            #     print(f"[Runner] Saved parameter drift checkpoint: {drift_path}")
+            # except Exception as e:
+            #     print(f"[Runner] Failed to save parameter drift checkpoint: {e}")
 
             steps = (episode + 1) * self.args.episode_len * self.args.num_envs
             print(pprint.pformat({k: round(np.mean(v), 4) for k, v in env_infos.items()}))
@@ -681,7 +684,7 @@ class Runner:
             del value, action, logprob, obs_img, reward, done
             
             # MOSAIC: Share and receive masks and compute embeddings
-            self.share_and_receive(episode, current_success=success)
+            # self.share_and_receive(episode, current_success=success)
             
             infos = self.train()
             
@@ -768,7 +771,7 @@ class Runner:
             if episode % self.args.interval_save == self.args.interval_save - 1 or episode == max_episodes - 1:
                 print(f"Saving model at {steps}")
                 save_path = self.glob_dir / f"steps_{episode:0>4d}"
-                self.policy.save(save_path)
+                # self.policy.save(save_path)
 
                 self.render(epoch=episode, obj_set="train")
                 self.render(epoch=episode, obj_set="test")

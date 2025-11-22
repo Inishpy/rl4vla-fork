@@ -12,11 +12,15 @@ Arguments:
 """
 
 # Set this variable to True to log only to file (and create log folders), or False to log only to terminal.
-LOG_TO_FILE_ONLY = True
+LOG_TO_FILE_ONLY = False
 
 # Set this variable to True to enable multiprocessing and server sockets,
 # or False to run a single VLA agent without multiprocessing or communication.
-multiprocess = True
+multiprocess = False
+
+# Set this variable to True to enable the parameter drift computation thread,
+# or False to disable it (no parameter drift monitoring will run).
+ENABLE_PARAMETER_DRIFT_MONITOR = False
 
 
 
@@ -176,7 +180,8 @@ def communication_module(Q_emb, Q_mask, addr_i, peer_addrs, server_side_selectio
     try:
         while True:
             # Wait for query from Q_emb (vi as list, ri as float)
-            vi, ri = Q_emb.get()
+            
+            vi, ri, mask_id, mask = Q_emb.get()
 
             # Compute mask here in Runner, but for comm, assume put after computing
             # In Runner/share_and_receive, compute mask if needed, but here assume own_mask is set
@@ -187,8 +192,8 @@ def communication_module(Q_emb, Q_mask, addr_i, peer_addrs, server_side_selectio
             # Wait, to make it work, modify to Q_emb.get() -> vi, ri, mask_id, mask_ser
 
             # For now, assume dummy, but in actual, change Q_emb.put to include mask_id, mask_ser
-            mask_id = 'current'
-            mask = [[1.0, 2.0]]  # Dummy, replace in actual with serialized LoRA
+            # mask_id = 'current'
+            # mask = [[1.0, 2.0]]  # Dummy, replace in actual with serialized LoRA
 
             with lock:
                 own_data['v'] = vi
@@ -238,7 +243,7 @@ def communication_module(Q_emb, Q_mask, addr_i, peer_addrs, server_side_selectio
                     cos_sim_val = cosine_sim(vi, vj)
                     is_similar = cos_sim_val > sim_threshold
                     is_better = rj > ri
-                    if is_similar and is_better:
+                    if True:#is_similar and is_better:
                         P.append((addrj, mask_id_j, rj, agent_id_j))
 
                 with lock:
@@ -273,7 +278,7 @@ def parse_args():
     parser.add_argument('--base_port', type=int, default=5000, help='Base port for TCP communication')
     parser.add_argument('--base_seed', type=int, default=0, help='Base seed for agents (each gets base_seed + i)')
     parser.add_argument('--base_name', type=str, default="vla-multi", help='Base name for runs (each gets base_name_i)')
-    parser.add_argument('--comm_interval', type=int, default=5, help='Episodes between communication rounds')
+    #parser.add_argument('--comm_interval', type=int, default=5, help='Episodes between communication rounds')
     parser.add_argument('--server_side_selection', action='store_true', help='Enable server-side peer selection (default: client-side)')
     parser.add_argument('--sim_threshold', type=float, default=0.8, help='Cosine similarity threshold for task alignment')
     args, unknown = parser.parse_known_args()
@@ -404,7 +409,7 @@ def main(timestamp):
             "--env-id", env_id,
             "--name", agent_name,
             "--seed", str(agent_seed),
-            "--comm-interval", str(args.comm_interval),
+            
             "--agent-id", "0",
             "--all-envs", env_id,
         ] + unknown
@@ -512,7 +517,7 @@ def main(timestamp):
             "--env-id", env_id,
             "--name", agent_name,
             "--seed", str(agent_seed),
-            "--comm-interval", str(args.comm_interval),
+           
             "--agent-id", str(i),
             "--all-envs", ",".join(ENVIRONMENTS[:args.num_agents]),
         ] + unknown
@@ -593,9 +598,16 @@ def main(timestamp):
     monitor_thread = threading.Thread(target=realtime_heatmap_monitor, args=(args.num_agents, "logs/" + timestamp + "/similarityheat"), daemon=True)
     monitor_thread.start()
 
-    # Start parameter drift monitor thread
-    drift_monitor_thread = threading.Thread(target=realtime_parameter_drift_monitor, args=(args.num_agents, "logs/" + timestamp + "/parameter_drift"), daemon=True)
-    drift_monitor_thread.start()
+    # Start parameter drift monitor thread if enabled
+    if ENABLE_PARAMETER_DRIFT_MONITOR:
+        drift_monitor_thread = threading.Thread(
+            target=realtime_parameter_drift_monitor,
+            args=(args.num_agents, "logs/" + timestamp + "/parameter_drift"),
+            daemon=True
+        )
+        drift_monitor_thread.start()
+    else:
+        drift_monitor_thread = None
 
     for i, proc in enumerate(procs):
         proc.join()
@@ -604,7 +616,8 @@ def main(timestamp):
     
 
     monitor_thread.join(timeout=2)
-    drift_monitor_thread.join(timeout=2)
+    if drift_monitor_thread is not None:
+        drift_monitor_thread.join(timeout=2)
 
 
 if __name__ == "__main__":
@@ -612,6 +625,4 @@ if __name__ == "__main__":
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     main(timestamp)
     
-    # After all agents have finished, try to generate heatmaps for all episodes
-    # (Optionally, this could be done in real-time, but here we do it after training)
     
