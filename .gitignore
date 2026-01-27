@@ -27,3 +27,6 @@ __pycache__
 nohup.out
 
 /wandb/
+
+*.xlsx
+*.txt

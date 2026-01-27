@@ -16,7 +16,7 @@ LOG_TO_FILE_ONLY = True
 
 # Set this variable to True to enable multiprocessing and server sockets,
 # or False to run a single VLA agent without multiprocessing or communication.
-multiprocess = True
+multiprocess = False
 
 
 
@@ -42,10 +42,11 @@ import torch
 from simpler_env.visualize import generate_similarity_heatmap
 # List of available environments
 ENVIRONMENTS = [
+    "PutEggplantInBasketScene-v1",
+    "StackGreenCubeOnYellowCubeBakedTexInScene-v1",
     "PutCarrotOnPlateInScene-v1",
     "PutSpoonOnTableClothInScene-v1",
-    "StackGreenCubeOnYellowCubeBakedTexInScene-v1",
-    "PutEggplantInBasketScene-v1",
+    
     "PutOnPlateInScene25Main-v3",
     "PutOnPlateInScene25VisionImage-v1",
     "PutOnPlateInScene25VisionTexture03-v1",
@@ -353,7 +354,7 @@ def worker(cli_args, timestamp, cuda_device, addr_i, peer_addrs, server_side_sel
     comm_proc.start()
 
     runner = Runner(args, train_xlsx, test_xlsx, sim_dir, pram_drift_dir,Q_emb, Q_mask)
-    print("test")
+    
     if args.only_render:
         ll = [
             "PutOnPlateInScene25VisionImage-v1",
@@ -423,7 +424,7 @@ def main(timestamp):
             sim_dir = Path("logs") / timestamp / "similarityheat"
             sim_dir.mkdir(parents=True, exist_ok=True)
             pram_drift_dir = Path("logs") / timestamp / "parameter_drift"
-            pram_drift_dir.mkdir(parents=True, ok=True)
+            pram_drift_dir.mkdir(parents=True, exist_ok=True)
             train_xlsx = log_dir / "train.xlsx"
             test_xlsx = log_dir / "test.xlsx"
             pd.DataFrame().to_excel(train_xlsx, index=False)
@@ -590,12 +591,12 @@ def main(timestamp):
                         print(f"[ParameterDrift] Failed to visualize drift for episode {ep}: {e}")
             time.sleep(2)  # Polling interval
     
-    monitor_thread = threading.Thread(target=realtime_heatmap_monitor, args=(args.num_agents, "logs/" + timestamp + "/similarityheat"), daemon=True)
-    monitor_thread.start()
+    # monitor_thread = threading.Thread(target=realtime_heatmap_monitor, args=(args.num_agents, "logs/" + timestamp + "/similarityheat"), daemon=True)
+    # monitor_thread.start()
 
-    # Start parameter drift monitor thread
-    drift_monitor_thread = threading.Thread(target=realtime_parameter_drift_monitor, args=(args.num_agents, "logs/" + timestamp + "/parameter_drift"), daemon=True)
-    drift_monitor_thread.start()
+    # # Start parameter drift monitor thread
+    # drift_monitor_thread = threading.Thread(target=realtime_parameter_drift_monitor, args=(args.num_agents, "logs/" + timestamp + "/parameter_drift"), daemon=True)
+    # drift_monitor_thread.start()
 
     for i, proc in enumerate(procs):
         proc.join()
@@ -603,8 +604,8 @@ def main(timestamp):
     
     
 
-    monitor_thread.join(timeout=2)
-    drift_monitor_thread.join(timeout=2)
+    # monitor_thread.join(timeout=2)
+    # drift_monitor_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

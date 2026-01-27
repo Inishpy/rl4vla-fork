@@ -67,11 +67,11 @@ class Args:
     num_envs: int = 16
     episode_len: int = 80
     use_same_init: bool = False
-    steps_max: int = 2000000
+    steps_max: int = 200000
     steps_vh: int = 0
-    interval_eval: int = 2
+    interval_eval: int = 5
     interval_save: int = 40
-    buffer_inferbatch: int = 4  #for rollout just pass chunks of env data to save memory
+    buffer_inferbatch: int = 40  #for rollout just pass chunks of env data to save memory
     buffer_minibatch: int = 2   #for training just pass chunks of stored buffer samples to save memory  
     buffer_gamma: float = 0.99
     buffer_lambda: float = 0.95
@@ -304,6 +304,7 @@ class Runner:
             q = q+1
             X.append(batch.squeeze().view(batch.shape[0],-1))
         X = torch.cat(X).to(self.device)
+        
         #print("QQQQQQQQQQQQ:", q)
         #print("FIRST X:", X)
         logging.info(f"X.shape: {X.shape}")
@@ -662,17 +663,17 @@ class Runner:
                         env_infos[f"{k}"] += v
 
             # --- Save policy checkpoint for parameter drift ---
-            try:
-                from safetensors.torch import save_file as safetensors_save_file
-                # Compose parameter drift directory path
-                print("drift_dir:", self.param_drift_dir)
-                drift_dir = self.param_drift_dir
-                drift_dir.mkdir(parents=True, exist_ok=True)
-                drift_path = drift_dir / f"policy_agent_{self.args.agent_id}_ep_{episode}.safetensors"
-                safetensors_save_file(self.policy.vla.state_dict(), str(drift_path))
-                print(f"[Runner] Saved parameter drift checkpoint: {drift_path}")
-            except Exception as e:
-                print(f"[Runner] Failed to save parameter drift checkpoint: {e}")
+            # try:
+            #     from safetensors.torch import save_file as safetensors_save_file
+            #     # Compose parameter drift directory path
+            #     print("drift_dir:", self.param_drift_dir)
+            #     drift_dir = self.param_drift_dir
+            #     drift_dir.mkdir(parents=True, exist_ok=True)
+            #     drift_path = drift_dir / f"policy_agent_{self.args.agent_id}_ep_{episode}.safetensors"
+            #     safetensors_save_file(self.policy.vla.state_dict(), str(drift_path))
+            #     print(f"[Runner] Saved parameter drift checkpoint: {drift_path}")
+            # except Exception as e:
+            #     print(f"[Runner] Failed to save parameter drift checkpoint: {e}")
 
             steps = (episode + 1) * self.args.episode_len * self.args.num_envs
             print(pprint.pformat({k: round(np.mean(v), 4) for k, v in env_infos.items()}))
@@ -681,7 +682,7 @@ class Runner:
             del value, action, logprob, obs_img, reward, done
             
             # MOSAIC: Share and receive masks and compute embeddings
-            self.share_and_receive(episode, current_success=success)
+            # self.share_and_receive(episode, current_success=success)
             
             infos = self.train()
             

@@ -36,7 +36,7 @@ class OpenVLAPolicy:
             trust_remote_code=True
         )
         # self.action_tokenizer = ActionTokenizer(self.processor.tokenizer)
-        self.vla = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+        self.base = OpenVLAForActionPredictionWithValueHead.from_pretrained(
             self.args.vla_path,
             attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
             torch_dtype=torch.bfloat16,
@@ -45,6 +45,148 @@ class OpenVLAPolicy:
             device_map="cuda:" + str(self.device_id),
             vh_mode="a0",
         )
+
+        # Load LoRA adaptor as a second model for linear combination
+        self.vla_lora1 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+            self.args.vla_path,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map="cuda:" + str(self.device_id),
+            vh_mode="a0",
+        )
+        self.vla_lora1 = PeftModel.from_pretrained(
+            self.vla_lora1,
+            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-5qr1fw06/glob/steps_0239",    #PutEggplantInBasketScene-v1
+            is_trainable=True
+        )
+
+        # Linear combination weight for LoRA adaptor (trainable)
+        # Remove global lora_weight, will use per-layer beta instead
+
+        # Load two more LoRA adaptors from dummy paths
+        self.vla_lora2 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+            self.args.vla_path,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map="cuda:" + str(self.device_id),
+            vh_mode="a0",
+        )
+        self.vla_lora2 = PeftModel.from_pretrained(
+            self.vla_lora2,
+            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
+            is_trainable=True
+        )
+        self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+            self.args.vla_path,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map="cuda:" + str(self.device_id),
+            vh_mode="a0",
+        )
+        self.vla_lora3 = PeftModel.from_pretrained(
+            self.vla_lora3,
+            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-us074evv/glob/steps_0239",  #PutSpoonOnTableClothInScene-v1
+            is_trainable=True
+        )
+        
+        #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-wldmtz9r/glob/steps_0239  #StackcubesInScene-v1
+        #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-h53zetbs/glob/steps_0159  #PutOnPlateInScene25VisionImage-v1
+        #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-b4w5dizr/glob/steps_0159  #PutOnPlateInScene25-v1
+
+        # Patch all LoRA layers to use per-layer trainable betas for 1-3 adaptors
+        def patch_lora_layers(base_model, lora1, lora2=None, lora3=None):
+            # Build name -> module dicts
+            base_mods = dict(base_model.named_modules())
+            l1_mods = dict(lora1.named_modules())
+            l2_mods = dict(lora2.named_modules()) if lora2 is not None else {}
+            l3_mods = dict(lora3.named_modules()) if lora3 is not None else {}
+
+            for name, mod_base in base_mods.items():
+                # Only patch layers that exist in base and lora1 (lora1 is required)
+                if name not in l1_mods:
+                    continue
+
+                mod_l1 = l1_mods[name]
+                
+                # Check if lora2 and lora3 have this layer (if they're provided)
+                mod_l2 = l2_mods.get(name) if lora2 is not None else None
+                mod_l3 = l3_mods.get(name) if lora3 is not None else None
+
+                # Heuristic: only patch LoRA-wrapped modules or linear-like modules
+                # Adjust the class name check to match your Lora layer class name if needed
+                if mod_base.__class__.__name__ != mod_l1.__class__.__name__:
+                    continue
+                
+                # Create beta for base model too
+                if not hasattr(mod_base, "beta_base"):
+                    device = next(mod_base.parameters()).device
+                    num_models = 1 + 1 + (mod_l2 is not None) + (mod_l3 is not None)  # base + lora1 + optional
+                    init_value = 1.0 / num_models
+                    
+                    mod_base.beta_base = torch.nn.Parameter(
+                        torch.tensor(init_value, dtype=torch.float32, device=device)
+                    )
+                    mod_base.register_parameter("beta_base", mod_base.beta_base)
+                    
+                    # Initialize LoRA betas the same way
+                    mod_base.beta1 = torch.nn.Parameter(
+                        torch.tensor(init_value, dtype=torch.float32, device=device)
+                    )
+                    mod_base.register_parameter("beta1", mod_base.beta1)
+                    
+                    mod_base.beta2 = torch.nn.Parameter(
+                        torch.tensor(init_value, dtype=torch.float32, device=device)
+                    )
+                    mod_base.register_parameter("beta2", mod_base.beta2)
+                    
+                    mod_base.beta3 = torch.nn.Parameter(
+                        torch.tensor(init_value, dtype=torch.float32, device=device)
+                    )
+                    mod_base.register_parameter("beta3", mod_base.beta3)
+
+                # Save the original forwards so we can call them directly
+                base_forward = mod_base.__class__.forward.__get__(mod_base, mod_base.__class__)
+                l1_forward = mod_l1.__class__.forward.__get__(mod_l1, mod_l1.__class__)
+                l2_forward = mod_l2.__class__.forward.__get__(mod_l2, mod_l2.__class__) if mod_l2 is not None else None
+                l3_forward = mod_l3.__class__.forward.__get__(mod_l3, mod_l3.__class__) if mod_l3 is not None else None
+
+                def make_new_forward(base_f, f1, f2, f3):
+                    # In the forward pass:
+                    def new_forward(self, x, *args, **kwargs):
+                        out_base = base_f(x, *args, **kwargs)
+                        out_l1 = f1(x, *args, **kwargs)
+                        
+                        # All models treated equally
+                        b_base = torch.clamp(self.beta_base, 0.0, 1.0)
+                        b1 = torch.clamp(self.beta1, 0.0, 1.0)
+                        
+                        result = b_base.to(out_base.dtype) * out_base + b1.to(out_base.dtype) * out_l1
+                        
+                        if f2 is not None:
+                            out_l2 = f2(x, *args, **kwargs)
+                            b2 = torch.clamp(self.beta2, 0.0, 1.0)
+                            result = result + b2.to(out_base.dtype) * out_l2
+                        
+                        if f3 is not None:
+                            out_l3 = f3(x, *args, **kwargs)
+                            b3 = torch.clamp(self.beta3, 0.0, 1.0)
+                            result = result + b3.to(out_base.dtype) * out_l3
+                        
+                        return result
+                    return new_forward
+
+                # Bind the new forward to the base module instance
+                mod_base.forward = make_new_forward(base_forward, l1_forward, l2_forward, l3_forward).__get__(mod_base, mod_base.__class__)
+
+
+        patch_lora_layers(self.base, self.vla_lora2, self.vla_lora3)#, self.vla_lora2, self.vla_lora3)
+        self.vla = self.base
 
         # openvla: lora
         if not self.args.vla_load_path:
@@ -104,6 +246,7 @@ class OpenVLAPolicy:
     def _setup_optimizer(self):
         self.params_vh = [p for n, p in self.vla.named_parameters() if "value_head" in n and p.requires_grad]
         self.params_vla = [p for n, p in self.vla.named_parameters() if "value_head" not in n and p.requires_grad]
+        # All per-layer beta parameters are now included via named_parameters
         betas = (self.args.vla_optim_beta1, self.args.vla_optim_beta2)
         self.vh_optimizer = AdamW(self.params_vh, lr=self.args.vla_vhlr, betas=betas)
         self.vla_optimizer = AdamW(self.params_vla, lr=self.args.vla_lr, betas=betas)
@@ -249,6 +392,7 @@ class OpenVLAPolicy:
 
         training_state_path = path / "training_state.pt"
         training_state = torch.load(training_state_path, map_location=self.tpdv["device"])
+        # No global lora_weight to restore; per-layer betas are handled as parameters
 
         if "vh" in training_state:
             self.vla.value_head.load_state_dict(training_state['vh'], assign=True)
