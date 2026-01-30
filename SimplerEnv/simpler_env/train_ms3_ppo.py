@@ -812,20 +812,26 @@ def main():
     Q_mask = mp.Queue() if args.comm_interval > 0 else None
     runner = Runner(args, train_xlsx, test_xlsx, Q_emb, Q_mask)
     if args.only_render:
-        ll = [
-            "PutOnPlateInScene25VisionImage-v1",
-            "PutOnPlateInScene25VisionTexture03-v1",
-            "PutOnPlateInScene25VisionTexture05-v1",
-            "PutOnPlateInScene25VisionWhole03-v1",
-            "PutOnPlateInScene25VisionWhole05-v1",
-            "PutOnPlateInScene25Instruct-v1",
-            "PutOnPlateInScene25Plate-v1",
-            "PutOnPlateInScene25Position-v1",
-            "PutOnPlateInScene25EEPose-v1",
-            "PutOnPlateInScene25PositionChange-v1",
-            "PutOnPlateInScene25PositionChangeTo-v1"
+        # Use all tabletop tasks from ManiSkill
+        tabletop_tasks = [
+            "PickCube-v1",
+            "PickSingleYCB-v1",
+            "PokeCube-v1",
+            "RollBall-v1",
+            "TwoRobotPickCube-v1",
+            "PushCube-v1",
+            "PlaceSphere-v1",
+            "PushT-v1",
+            "LiftPegUpright-v1",
+            "PullCube-v1",
+            "TurnFaucet-v1",
+            "PlugCharger-v1",
+            "PegInsertionSide-v1",
+            "TwoRobotStackCube-v1",
+            "StackCube-v1",
+            "PullCubeTool-v1"
         ]
-        if args.env_id not in ll:
+        if args.env_id not in tabletop_tasks:
             runner.render(epoch=0, obj_set="train")
         runner.render(epoch=0, obj_set="test")
     else:

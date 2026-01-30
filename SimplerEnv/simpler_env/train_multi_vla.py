@@ -12,11 +12,11 @@ Arguments:
 """
 
 # Set this variable to True to log only to file (and create log folders), or False to log only to terminal.
-LOG_TO_FILE_ONLY = True
+LOG_TO_FILE_ONLY = False
 
 # Set this variable to True to enable multiprocessing and server sockets,
 # or False to run a single VLA agent without multiprocessing or communication.
-multiprocess = False
+multiprocess = True
 
 
 
@@ -40,7 +40,7 @@ import time
 from train_ms3_ppo import Args, Runner
 import torch
 from simpler_env.visualize import generate_similarity_heatmap
-# List of available environments
+# List of available environments (all tabletop tasks from ManiSkill)
 ENVIRONMENTS = [
     "PutEggplantInBasketScene-v1",
     "StackGreenCubeOnYellowCubeBakedTexInScene-v1",
@@ -50,6 +50,22 @@ ENVIRONMENTS = [
     "PutOnPlateInScene25Main-v3",
     "PutOnPlateInScene25VisionImage-v1",
     "PutOnPlateInScene25VisionTexture03-v1",
+    "PickCube-v1",
+    "PickSingleYCB-v1",
+    "PokeCube-v1",
+    "RollBall-v1",
+    "TwoRobotPickCube-v1",
+    "PushCube-v1",
+    "PlaceSphere-v1",
+    "PushT-v1",
+    "LiftPegUpright-v1",
+    "PullCube-v1",
+    "TurnFaucet-v1",
+    "PlugCharger-v1",
+    "PegInsertionSide-v1",
+    "TwoRobotStackCube-v1",
+    "StackCube-v1",
+    "PullCubeTool-v1"
 ]
 
 
@@ -356,20 +372,8 @@ def worker(cli_args, timestamp, cuda_device, addr_i, peer_addrs, server_side_sel
     runner = Runner(args, train_xlsx, test_xlsx, sim_dir, pram_drift_dir,Q_emb, Q_mask)
     
     if args.only_render:
-        ll = [
-            "PutOnPlateInScene25VisionImage-v1",
-            "PutOnPlateInScene25VisionTexture03-v1",
-            "PutOnPlateInScene25VisionTexture05-v1",
-            "PutOnPlateInScene25VisionWhole03-v1",
-            "PutOnPlateInScene25VisionWhole05-v1",
-            "PutOnPlateInScene25Instruct-v1",
-            "PutOnPlateInScene25Plate-v1",
-            "PutOnPlateInScene25Position-v1",
-            "PutOnPlateInScene25EEPose-v1",
-            "PutOnPlateInScene25PositionChange-v1",
-            "PutOnPlateInScene25PositionChangeTo-v1"
-        ]
-        if args.env_id not in ll:
+        tabletop_tasks = ENVIRONMENTS
+        if args.env_id not in tabletop_tasks:
             runner.render(epoch=0, obj_set="train")
         runner.render(epoch=0, obj_set="test")
     else:
@@ -461,20 +465,8 @@ def main(timestamp):
         # No communication module, just run the agent
         runner = Runner(agent_args, train_xlsx, test_xlsx, sim_dir, pram_drift_dir,None, None)
         if agent_args.only_render:
-            ll = [
-                "PutOnPlateInScene25VisionImage-v1",
-                "PutOnPlateInScene25VisionTexture03-v1",
-                "PutOnPlateInScene25VisionTexture05-v1",
-                "PutOnPlateInScene25VisionWhole03-v1",
-                "PutOnPlateInScene25VisionWhole05-v1",
-                "PutOnPlateInScene25Instruct-v1",
-                "PutOnPlateInScene25Plate-v1",
-                "PutOnPlateInScene25Position-v1",
-                "PutOnPlateInScene25EEPose-v1",
-                "PutOnPlateInScene25PositionChange-v1",
-                "PutOnPlateInScene25PositionChangeTo-v1"
-            ]
-            if agent_args.env_id not in ll:
+            tabletop_tasks = ENVIRONMENTS
+            if agent_args.env_id not in tabletop_tasks:
                 runner.render(epoch=0, obj_set="train")
             runner.render(epoch=0, obj_set="test")
         else:

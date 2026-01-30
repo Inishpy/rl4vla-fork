@@ -1,3 +1,4 @@
+
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -7,10 +8,14 @@ import torch
 from torch import nn
 from torch.optim import AdamW
 from peft import LoraConfig, get_peft_model, PeftModel
+from peft.tuners.lora.layer import LoraLayer
 from tqdm import tqdm
 from transformers import AutoTokenizer, BatchFeature
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPredictionWithValueHead
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+# Import MultiHeadLoraLinear using a relative import to avoid PYTHONPATH issues
+from .multihead_lora import MultiHeadLoraLinear
 
 def huber_loss(e, d):
     a = (abs(e) <= d).to(torch.float32)
@@ -99,94 +104,85 @@ class OpenVLAPolicy:
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-h53zetbs/glob/steps_0159  #PutOnPlateInScene25VisionImage-v1
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-b4w5dizr/glob/steps_0159  #PutOnPlateInScene25-v1
 
-        # Patch all LoRA layers to use per-layer trainable betas for 1-3 adaptors
-        def patch_lora_layers(base_model, lora1, lora2=None, lora3=None):
-            # Build name -> module dicts
+        # --- MultiHeadLoraLinear integration ---
+        def _is_supported_lora_layer(mod):
+            return isinstance(mod, LoraLayer) and isinstance(getattr(mod, "base_layer", None), nn.Linear)
+
+        def _extract_adapter_cfg(mod: LoraLayer, adapter_key: str):
+            r = mod.lora_A[adapter_key].out_features
+            scaling = mod.scaling[adapter_key]
+            lora_alpha = int(round(float(scaling) * r)) if scaling is not None else r
+            dropout_p = getattr(mod.lora_dropout[adapter_key], "p", 0.0)
+            return r, lora_alpha, dropout_p
+
+        def _replace_linear_with_multihead(base_model, lora_models, adapter_names):
             base_mods = dict(base_model.named_modules())
-            l1_mods = dict(lora1.named_modules())
-            l2_mods = dict(lora2.named_modules()) if lora2 is not None else {}
-            l3_mods = dict(lora3.named_modules()) if lora3 is not None else {}
+            lora_mods_list = [dict(m.named_modules()) for m in lora_models]
+            replaced = 0
 
-            for name, mod_base in base_mods.items():
-                # Only patch layers that exist in base and lora1 (lora1 is required)
-                if name not in l1_mods:
+            for name, base_mod in base_mods.items():
+                if not isinstance(base_mod, nn.Linear):
                     continue
 
-                mod_l1 = l1_mods[name]
-                
-                # Check if lora2 and lora3 have this layer (if they're provided)
-                mod_l2 = l2_mods.get(name) if lora2 is not None else None
-                mod_l3 = l3_mods.get(name) if lora3 is not None else None
+                active_adapter_names = []
+                r_list, alpha_list, dropout_list = [], [], []
+                lora_param_src = {}
 
-                # Heuristic: only patch LoRA-wrapped modules or linear-like modules
-                # Adjust the class name check to match your Lora layer class name if needed
-                if mod_base.__class__.__name__ != mod_l1.__class__.__name__:
+                for adapter_name, lora_mods in zip(adapter_names, lora_mods_list):
+                    mod = lora_mods.get(name)
+                    if mod is None or not _is_supported_lora_layer(mod):
+                        continue
+
+                    adapter_key = next(iter(mod.lora_A.keys()))
+                    r, lora_alpha, lora_dropout = _extract_adapter_cfg(mod, adapter_key)
+                    active_adapter_names.append(adapter_name)
+                    r_list.append(r)
+                    alpha_list.append(lora_alpha)
+                    dropout_list.append(lora_dropout)
+                    lora_param_src[adapter_name] = (adapter_key, mod)
+
+                if not active_adapter_names:
                     continue
-                
-                # Create beta for base model too
-                if not hasattr(mod_base, "beta_base"):
-                    device = next(mod_base.parameters()).device
-                    num_models = 1 + 1 + (mod_l2 is not None) + (mod_l3 is not None)  # base + lora1 + optional
-                    init_value = 1.0 / num_models
-                    
-                    mod_base.beta_base = torch.nn.Parameter(
-                        torch.tensor(init_value, dtype=torch.float32, device=device)
-                    )
-                    mod_base.register_parameter("beta_base", mod_base.beta_base)
-                    
-                    # Initialize LoRA betas the same way
-                    mod_base.beta1 = torch.nn.Parameter(
-                        torch.tensor(init_value, dtype=torch.float32, device=device)
-                    )
-                    mod_base.register_parameter("beta1", mod_base.beta1)
-                    
-                    mod_base.beta2 = torch.nn.Parameter(
-                        torch.tensor(init_value, dtype=torch.float32, device=device)
-                    )
-                    mod_base.register_parameter("beta2", mod_base.beta2)
-                    
-                    mod_base.beta3 = torch.nn.Parameter(
-                        torch.tensor(init_value, dtype=torch.float32, device=device)
-                    )
-                    mod_base.register_parameter("beta3", mod_base.beta3)
 
-                # Save the original forwards so we can call them directly
-                base_forward = mod_base.__class__.forward.__get__(mod_base, mod_base.__class__)
-                l1_forward = mod_l1.__class__.forward.__get__(mod_l1, mod_l1.__class__)
-                l2_forward = mod_l2.__class__.forward.__get__(mod_l2, mod_l2.__class__) if mod_l2 is not None else None
-                l3_forward = mod_l3.__class__.forward.__get__(mod_l3, mod_l3.__class__) if mod_l3 is not None else None
+                mhl = MultiHeadLoraLinear(
+                    base_mod,
+                    adapter_names=active_adapter_names,
+                    r_list=r_list,
+                    lora_alpha_list=alpha_list,
+                    lora_dropout_list=dropout_list,
+                    init_lora_weights_list=[False] * len(active_adapter_names),
+                )
 
-                def make_new_forward(base_f, f1, f2, f3):
-                    # In the forward pass:
-                    def new_forward(self, x, *args, **kwargs):
-                        out_base = base_f(x, *args, **kwargs)
-                        out_l1 = f1(x, *args, **kwargs)
-                        
-                        # All models treated equally
-                        b_base = torch.clamp(self.beta_base, 0.0, 1.0)
-                        b1 = torch.clamp(self.beta1, 0.0, 1.0)
-                        
-                        result = b_base.to(out_base.dtype) * out_base + b1.to(out_base.dtype) * out_l1
-                        
-                        if f2 is not None:
-                            out_l2 = f2(x, *args, **kwargs)
-                            b2 = torch.clamp(self.beta2, 0.0, 1.0)
-                            result = result + b2.to(out_base.dtype) * out_l2
-                        
-                        if f3 is not None:
-                            out_l3 = f3(x, *args, **kwargs)
-                            b3 = torch.clamp(self.beta3, 0.0, 1.0)
-                            result = result + b3.to(out_base.dtype) * out_l3
-                        
-                        return result
-                    return new_forward
+                # Copy LoRA weights and scaling
+                for adapter_name in active_adapter_names:
+                    adapter_key, src_mod = lora_param_src[adapter_name]
+                    mhl.lora_A[adapter_name].weight.data.copy_(src_mod.lora_A[adapter_key].weight.data)
+                    mhl.lora_B[adapter_name].weight.data.copy_(src_mod.lora_B[adapter_key].weight.data)
+                    mhl.scaling[adapter_name] = src_mod.scaling[adapter_key]
 
-                # Bind the new forward to the base module instance
-                mod_base.forward = make_new_forward(base_forward, l1_forward, l2_forward, l3_forward).__get__(mod_base, mod_base.__class__)
+                # Move to the same device/dtype as the base module
+                mhl.to(base_mod.weight.device)
 
+                # Replace module in the base model
+                if name == "":
+                    continue
+                parent = base_model
+                path = name.split(".")
+                for p in path[:-1]:
+                    parent = getattr(parent, p)
+                setattr(parent, path[-1], mhl)
+                replaced += 1
 
-        patch_lora_layers(self.base, self.vla_lora2, self.vla_lora3)#, self.vla_lora2, self.vla_lora3)
+            print(f"MultiHeadLoraLinear: replaced {replaced} Linear layers")
+
+        _replace_linear_with_multihead(
+            self.base,
+            lora_models=[self.vla_lora1, self.vla_lora2, self.vla_lora3],
+            adapter_names=["lora1", "lora2", "lora3"],
+        )
+
         self.vla = self.base
+        # --- End MultiHeadLoraLinear integration ---
 
         # openvla: lora
         if not self.args.vla_load_path:
@@ -218,6 +214,17 @@ class OpenVLAPolicy:
 
         self.vla.print_trainable_parameters()
 
+        # Print all layers in the model after loading
+        print("\nAll layers in self.vla (trainable and non-trainable), up to 4 levels:")
+        for name, module in self.vla.named_modules():
+            # Count the number of levels by splitting on '.'
+            if name == "":
+                level = 0
+            else:
+                level = name.count('.') + 1
+            if level <= 5:
+                print(f"{name}: {module.__class__.__name__}")
+        
         # openvla: optimizer
         self.params_vh = None
         self.params_vla = None
@@ -385,6 +392,16 @@ class OpenVLAPolicy:
         )
         self.vla = PeftModel.from_pretrained(self.vla, path, is_trainable=True)
         self.vla.print_trainable_parameters()
+
+        # Print all layers in the model after loading (in load method)
+        print("\nAll layers in self.vla (trainable and non-trainable) after load, up to 4 levels:")
+        for name, module in self.vla.named_modules():
+            if name == "":
+                level = 0
+            else:
+                level = name.count('.') + 1
+            if level <= 4:
+                print(f"{name}: {module.__class__.__name__}")
 
         if self.args.vla_unnorm_key not in self.vla.base_model.norm_stats:
             ds = json.load(open(path / "dataset_statistics.json", "r"))
