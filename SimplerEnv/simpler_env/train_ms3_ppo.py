@@ -92,6 +92,8 @@ class Args:
     alg_entropy_coef: float = 0.0
     wandb: bool = False
     only_render: bool = False
+    eval_only: bool = False
+    eval_obj_set: str = "test"
     render_info: bool = False
     num_eval_runs: int = 1
     # MOSAIC-specific args
@@ -681,7 +683,7 @@ class Runner:
             del value, action, logprob, obs_img, reward, done
             
             # MOSAIC: Share and receive masks and compute embeddings
-            self.share_and_receive(episode, current_success=success)
+            # self.share_and_receive(episode, current_success=success)
             
             infos = self.train()
             
@@ -810,7 +812,24 @@ def main():
     Q_emb = mp.Queue() if args.comm_interval > 0 else None
     Q_mask = mp.Queue() if args.comm_interval > 0 else None
     runner = Runner(args, train_xlsx, test_xlsx, Q_emb, Q_mask)
-    if args.only_render:
+    if args.eval_only:
+        if not args.vla_load_path:
+            logging.warning("eval_only is True but vla_load_path is empty; evaluating base model without LoRA weights.")
+
+        def aggregate_eval(runs):
+            keys = runs[0].keys() if runs else []
+            mean = {k: np.mean([d[k] for d in runs]) for k in keys}
+            std = {k: np.std([d[k] for d in runs]) for k in keys}
+            return mean, std
+
+        eval_runs = [runner.eval(obj_set=args.eval_obj_set) for _ in range(args.num_eval_runs)]
+        mean_stats, std_stats = aggregate_eval(eval_runs)
+        sval_stats = {f"eval/{k}": v for k, v in mean_stats.items()}
+        sval_stats.update({f"eval/{k}_std": std_stats[k] for k in mean_stats})
+        wandb.log(sval_stats, step=0)
+        print("Eval mean:", pprint.pformat({k: round(v, 4) for k, v in mean_stats.items()}))
+        print("Eval std:", pprint.pformat({k: round(v, 4) for k, v in std_stats.items()}))
+    elif args.only_render:
         ll = [
             "PutOnPlateInScene25VisionImage-v1",
             "PutOnPlateInScene25VisionTexture03-v1",
