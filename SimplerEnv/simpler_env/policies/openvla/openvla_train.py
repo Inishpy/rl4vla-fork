@@ -58,7 +58,7 @@ class OpenVLAPolicy:
         )
         self.vla_lora1 = PeftModel.from_pretrained(
             self.vla_lora1,
-            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-5qr1fw06/glob/steps_0239",    #PutEggplantInBasketScene-v1
+            "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-5qr1fw06/glob/steps_0239",    #PutEggplantInBasketScene-v1
             is_trainable=True
         )
 
@@ -77,7 +77,7 @@ class OpenVLAPolicy:
         )
         self.vla_lora2 = PeftModel.from_pretrained(
             self.vla_lora2,
-            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
+            "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
             is_trainable=True
         )
         self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
@@ -91,7 +91,7 @@ class OpenVLAPolicy:
         )
         self.vla_lora3 = PeftModel.from_pretrained(
             self.vla_lora3,
-            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-us074evv/glob/steps_0239",  #PutSpoonOnTableClothInScene-v1
+            "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-us074evv/glob/steps_0239",  #PutSpoonOnTableClothInScene-v1
             is_trainable=True
         )
         

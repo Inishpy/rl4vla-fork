@@ -64,14 +64,14 @@ class Args:
     seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 0
     name: str = "MOSAIC-test"
     
-    num_envs: int = 16
+    num_envs: int = 1
     episode_len: int = 80
     use_same_init: bool = False
     steps_max: int = 200000
     steps_vh: int = 0
     interval_eval: int = 5
     interval_save: int = 40
-    buffer_inferbatch: int = 40  #for rollout just pass chunks of env data to save memory
+    buffer_inferbatch: int = 2  #for rollout just pass chunks of env data to save memory
     buffer_minibatch: int = 2   #for training just pass chunks of stored buffer samples to save memory  
     buffer_gamma: float = 0.99
     buffer_lambda: float = 0.95

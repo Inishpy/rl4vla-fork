@@ -12,7 +12,7 @@ Arguments:
 """
 
 # Set this variable to True to log only to file (and create log folders), or False to log only to terminal.
-LOG_TO_FILE_ONLY = True
+LOG_TO_FILE_ONLY = False
 
 # Set this variable to True to enable multiprocessing and server sockets,
 # or False to run a single VLA agent without multiprocessing or communication.

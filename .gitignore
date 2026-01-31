@@ -15,6 +15,7 @@ __pycache__
 /octo/
 /datasets/
 /ManiSkill/mp_collect/
+/ManiSkill/.eggs/
 /openvla/checkpoints/
 /openvla/wandb/
 /SimplerEnv/octo_collect/
@@ -29,4 +30,5 @@ nohup.out
 /wandb/
 
 *.xlsx
+.env
 *.txt
