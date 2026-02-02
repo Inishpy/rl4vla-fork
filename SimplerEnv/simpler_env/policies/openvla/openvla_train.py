@@ -71,21 +71,21 @@ class OpenVLAPolicy:
                 self.vla.base_model.norm_stats[self.args.vla_unnorm_key] = ds[self.args.vla_unnorm_key]
 
         # Load frozen LoRA adaptors to be linearly combined (betas control their contribution; their weights stay frozen)
-        self.vla_lora1 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
-            self.args.vla_path,
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            device_map="cuda:" + str(self.device_id),
-            vh_mode="a0",
-        )
-        self.vla_lora1 = PeftModel.from_pretrained(
-            self.vla_lora1,
-            "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-5qr1fw06/glob/steps_0239",    #PutEggplantInBasketScene-v1
-            is_trainable=False
-        )
-        self.vla_lora1.requires_grad_(False)
+        # self.vla_lora1 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+        #     self.args.vla_path,
+        #     attn_implementation="flash_attention_2",
+        #     torch_dtype=torch.bfloat16,
+        #     low_cpu_mem_usage=True,
+        #     trust_remote_code=True,
+        #     device_map="cuda:" + str(self.device_id),
+        #     vh_mode="a0",
+        # )
+        # self.vla_lora1 = PeftModel.from_pretrained(
+        #     self.vla_lora1,
+        #     "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-5qr1fw06/glob/steps_0239",    #PutEggplantInBasketScene-v1
+        #     is_trainable=False
+        # )
+        # self.vla_lora1.requires_grad_(False)
 
         self.vla_lora2 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
             self.args.vla_path,
@@ -98,26 +98,26 @@ class OpenVLAPolicy:
         )
         self.vla_lora2 = PeftModel.from_pretrained(
             self.vla_lora2,
-            "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
+            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-b4w5dizr/glob/steps_0159",#/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
             is_trainable=False
         )
         self.vla_lora2.requires_grad_(False)
 
-        self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
-            self.args.vla_path,
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            device_map="cuda:" + str(self.device_id),
-            vh_mode="a0",
-        )
-        self.vla_lora3 = PeftModel.from_pretrained(
-            self.vla_lora3,
-            "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-us074evv/glob/steps_0239",  #PutSpoonOnTableClothInScene-v1
-            is_trainable=False
-        )
-        self.vla_lora3.requires_grad_(False)
+        # self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+        #     self.args.vla_path,
+        #     attn_implementation="flash_attention_2",
+        #     torch_dtype=torch.bfloat16,
+        #     low_cpu_mem_usage=True,
+        #     trust_remote_code=True,
+        #     device_map="cuda:" + str(self.device_id),
+        #     vh_mode="a0",
+        # )
+        # self.vla_lora3 = PeftModel.from_pretrained(
+        #     self.vla_lora3,
+        #     "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-us074evv/glob/steps_0239",  #PutSpoonOnTableClothInScene-v1
+        #     is_trainable=False
+        # )
+        # self.vla_lora3.requires_grad_(False)
         
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-wldmtz9r/glob/steps_0239  #StackcubesInScene-v1
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-h53zetbs/glob/steps_0159  #PutOnPlateInScene25VisionImage-v1
@@ -133,7 +133,10 @@ class OpenVLAPolicy:
                 return torch.tensor(value, dtype=torch.float32, device=device)
 
             def has_lora_params(mod) -> bool:
-                return any("lora_" in n for n, _ in mod.named_parameters())
+                # Only consider parameters **directly** on this module to avoid wrapping parents that merely
+                # contain LoRA children (e.g., the entire vision backbone). Wrapping such parents can distort
+                # output shapes, as seen in fused vision cat errors.
+                return any("lora_" in n for n, _ in mod.named_parameters(recurse=False))
 
             # Build name -> module dicts
             base_mods = dict(base_model.named_modules())
@@ -200,9 +203,11 @@ class OpenVLAPolicy:
 
                 def make_new_forward(base_f, f1, f2, f3):
                     # In the forward pass:
-                    def new_forward(self, x, *args, **kwargs):
-                        out_base = base_f(x, *args, **kwargs)
-                        out_l1 = f1(x, *args, **kwargs)
+                    # NOTE: Some modules are invoked with positional args, others with kwargs only
+                    # (e.g., hidden_states=...). Do not force a positional `x` to avoid missing-arg errors.
+                    def new_forward(self, *args, **kwargs):
+                        out_base = base_f(*args, **kwargs)
+                        out_l1 = f1(*args, **kwargs)
                         
                         # All models treated equally
                         b_base = torch.clamp(self.beta_base, 0.0, 1.0)
@@ -211,12 +216,12 @@ class OpenVLAPolicy:
                         result = b_base.to(out_base.dtype) * out_base + b1.to(out_base.dtype) * out_l1
                         
                         if f2 is not None:
-                            out_l2 = f2(x, *args, **kwargs)
+                            out_l2 = f2(*args, **kwargs)
                             b2 = torch.clamp(self.beta2, 0.0, 1.0)
                             result = result + b2.to(out_base.dtype) * out_l2
                         
                         if f3 is not None:
-                            out_l3 = f3(x, *args, **kwargs)
+                            out_l3 = f3(*args, **kwargs)
                             b3 = torch.clamp(self.beta3, 0.0, 1.0)
                             result = result + b3.to(out_base.dtype) * out_l3
                         

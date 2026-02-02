@@ -34,3 +34,5 @@ nohup.out
 *.txt
 
 *.err
+logs/
+*.urdf

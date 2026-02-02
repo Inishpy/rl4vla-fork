@@ -61,7 +61,7 @@ class Args:
     which runs faster enabling faster large-scale evaluations. Note that the overall behavior of the simulation
     will be slightly different between CPU and GPU backends."""
 
-    seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 0
+    seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 1
     name: str = "MOSAIC-test"
     
     num_envs: int = 16
@@ -93,8 +93,8 @@ class Args:
     wandb: bool = False
     only_render: bool = False
     render_info: bool = False
-    num_eval_runs: int = 1
-    log_to_file: bool = False
+    num_eval_runs: int = 3
+    log_to_file: bool = True
     # MOSAIC-specific args
     force_sharing_test: bool = False
     comm_interval: int = 3
