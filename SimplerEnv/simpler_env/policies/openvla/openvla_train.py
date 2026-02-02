@@ -1,4 +1,5 @@
 import json
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -46,7 +47,30 @@ class OpenVLAPolicy:
             vh_mode="a0",
         )
 
-        # Load LoRA adaptor as a second model for linear combination
+        # Attach a trainable LoRA adaptor directly to the base model (this is the only LoRA whose weights we train)
+        if not self.args.vla_load_path:
+            lora_config = LoraConfig(
+                r=self.args.vla_lora_rank,
+                lora_alpha=min(self.args.vla_lora_rank, 16),
+                lora_dropout=0.0,
+                target_modules=[
+                    "proj", "qkv", "fc1", "fc2",  # vision
+                    "q", "kv", "fc3",  # project
+                    "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head",  # llm
+                ],
+                init_lora_weights="gaussian"
+            )
+            self.vla = get_peft_model(self.base, lora_config)
+        else:
+            self.vla = PeftModel.from_pretrained(self.base, self.args.vla_load_path, is_trainable=True)
+            print(f"VLA load: {self.args.vla_load_path}")
+
+            if self.args.vla_unnorm_key not in self.vla.base_model.norm_stats:
+                path = Path(self.args.vla_load_path) / "dataset_statistics.json"
+                ds = json.load(open(path, "r"))
+                self.vla.base_model.norm_stats[self.args.vla_unnorm_key] = ds[self.args.vla_unnorm_key]
+
+        # Load frozen LoRA adaptors to be linearly combined (betas control their contribution; their weights stay frozen)
         self.vla_lora1 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
             self.args.vla_path,
             attn_implementation="flash_attention_2",
@@ -59,13 +83,10 @@ class OpenVLAPolicy:
         self.vla_lora1 = PeftModel.from_pretrained(
             self.vla_lora1,
             "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-5qr1fw06/glob/steps_0239",    #PutEggplantInBasketScene-v1
-            is_trainable=True
+            is_trainable=False
         )
+        self.vla_lora1.requires_grad_(False)
 
-        # Linear combination weight for LoRA adaptor (trainable)
-        # Remove global lora_weight, will use per-layer beta instead
-
-        # Load two more LoRA adaptors from dummy paths
         self.vla_lora2 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
             self.args.vla_path,
             attn_implementation="flash_attention_2",
@@ -78,8 +99,10 @@ class OpenVLAPolicy:
         self.vla_lora2 = PeftModel.from_pretrained(
             self.vla_lora2,
             "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
-            is_trainable=True
+            is_trainable=False
         )
+        self.vla_lora2.requires_grad_(False)
+
         self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
             self.args.vla_path,
             attn_implementation="flash_attention_2",
@@ -92,8 +115,9 @@ class OpenVLAPolicy:
         self.vla_lora3 = PeftModel.from_pretrained(
             self.vla_lora3,
             "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-us074evv/glob/steps_0239",  #PutSpoonOnTableClothInScene-v1
-            is_trainable=True
+            is_trainable=False
         )
+        self.vla_lora3.requires_grad_(False)
         
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-wldmtz9r/glob/steps_0239  #StackcubesInScene-v1
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-h53zetbs/glob/steps_0159  #PutOnPlateInScene25VisionImage-v1
@@ -101,6 +125,16 @@ class OpenVLAPolicy:
 
         # Patch all LoRA layers to use per-layer trainable betas for 1-3 adaptors
         def patch_lora_layers(base_model, lora1, lora2=None, lora3=None):
+            def beta_init_for_layer(layer_name: str, num_models: int, device: torch.device) -> torch.Tensor:
+                base = 1.0 / num_models
+                seed_int = int.from_bytes(hashlib.sha256(layer_name.encode("utf-8")).digest()[:8], "big")
+                scale = 0.9 + (seed_int % 21) / 100.0  # Deterministic spread in [0.90, 1.10]
+                value = min(max(base * scale, 1e-4), 1.0)
+                return torch.tensor(value, dtype=torch.float32, device=device)
+
+            def has_lora_params(mod) -> bool:
+                return any("lora_" in n for n, _ in mod.named_parameters())
+
             # Build name -> module dicts
             base_mods = dict(base_model.named_modules())
             l1_mods = dict(lora1.named_modules())
@@ -122,31 +156,39 @@ class OpenVLAPolicy:
                 # Adjust the class name check to match your Lora layer class name if needed
                 if mod_base.__class__.__name__ != mod_l1.__class__.__name__:
                     continue
-                
+
+                # Only create betas for modules that actually contain LoRA params
+                if not has_lora_params(mod_l1):
+                    continue
+                if mod_l2 is not None and not has_lora_params(mod_l2):
+                    mod_l2 = None
+                if mod_l3 is not None and not has_lora_params(mod_l3):
+                    mod_l3 = None
+
                 # Create beta for base model too
                 if not hasattr(mod_base, "beta_base"):
                     device = next(mod_base.parameters()).device
                     num_models = 1 + 1 + (mod_l2 is not None) + (mod_l3 is not None)  # base + lora1 + optional
-                    init_value = 1.0 / num_models
-                    
+                    init_value = beta_init_for_layer(name, num_models, device)
+
                     mod_base.beta_base = torch.nn.Parameter(
-                        torch.tensor(init_value, dtype=torch.float32, device=device)
+                        init_value.clone()
                     )
                     mod_base.register_parameter("beta_base", mod_base.beta_base)
-                    
+
                     # Initialize LoRA betas the same way
                     mod_base.beta1 = torch.nn.Parameter(
-                        torch.tensor(init_value, dtype=torch.float32, device=device)
+                        init_value.clone()
                     )
                     mod_base.register_parameter("beta1", mod_base.beta1)
-                    
+
                     mod_base.beta2 = torch.nn.Parameter(
-                        torch.tensor(init_value, dtype=torch.float32, device=device)
+                        init_value.clone()
                     )
                     mod_base.register_parameter("beta2", mod_base.beta2)
-                    
+
                     mod_base.beta3 = torch.nn.Parameter(
-                        torch.tensor(init_value, dtype=torch.float32, device=device)
+                        init_value.clone()
                     )
                     mod_base.register_parameter("beta3", mod_base.beta3)
 
@@ -185,31 +227,8 @@ class OpenVLAPolicy:
                 mod_base.forward = make_new_forward(base_forward, l1_forward, l2_forward, l3_forward).__get__(mod_base, mod_base.__class__)
 
 
-        patch_lora_layers(self.base, self.vla_lora2, self.vla_lora3)#, self.vla_lora2, self.vla_lora3)
-        self.vla = self.base
-
-        # openvla: lora
-        if not self.args.vla_load_path:
-            lora_config = LoraConfig(
-                r=self.args.vla_lora_rank,
-                lora_alpha=min(self.args.vla_lora_rank, 16),
-                lora_dropout=0.0,
-                target_modules=[
-                    "proj", "qkv", "fc1", "fc2",  # vision
-                    "q", "kv", "fc3",  # project
-                    "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head",  # llm
-                ],
-                init_lora_weights="gaussian"
-            )
-            self.vla = get_peft_model(self.vla, lora_config)
-        else:
-            self.vla = PeftModel.from_pretrained(self.vla, self.args.vla_load_path, is_trainable=True)
-            print(f"VLA load: {self.args.vla_load_path}")
-
-            if self.args.vla_unnorm_key not in self.vla.base_model.norm_stats:
-                path = Path(self.args.vla_load_path) / "dataset_statistics.json"
-                ds = json.load(open(path, "r"))
-                self.vla.base_model.norm_stats[self.args.vla_unnorm_key] = ds[self.args.vla_unnorm_key]
+        # Patch betas to merge: trainable base (with its LoRA) + frozen lora1/2/3
+        patch_lora_layers(self.vla, self.vla_lora2) #self.vla_lora2, self.vla_lora3)
 
         # set value head trainable
         for name, param in self.vla.named_parameters():
@@ -250,6 +269,23 @@ class OpenVLAPolicy:
         betas = (self.args.vla_optim_beta1, self.args.vla_optim_beta2)
         self.vh_optimizer = AdamW(self.params_vh, lr=self.args.vla_vhlr, betas=betas)
         self.vla_optimizer = AdamW(self.params_vla, lr=self.args.vla_lr, betas=betas)
+
+    def get_beta_stats(self) -> dict:
+        """Aggregate mean per-layer beta values for logging.
+
+        Returns a dict with keys beta_base, beta1, beta2, beta3 when present.
+        """
+        beta_keys = ("beta_base", "beta1", "beta2", "beta3")
+        accum = {k: [] for k in beta_keys}
+
+        for _, module in self.vla.named_modules():
+            for key in beta_keys:
+                if hasattr(module, key):
+                    param = getattr(module, key)
+                    if isinstance(param, torch.Tensor):
+                        accum[key].append(param.detach().float().mean().item())
+
+        return {k: float(np.mean(v)) for k, v in accum.items() if len(v) > 0}
 
     def _preprocess_obs(self, x: dict, action: torch.Tensor = None) -> BatchFeature:
         images = x["image"]

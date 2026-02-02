@@ -32,3 +32,5 @@ nohup.out
 *.xlsx
 .env
 *.txt
+
+*.err

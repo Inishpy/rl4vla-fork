@@ -53,7 +53,7 @@ from simpler_env.helpers import   obs_to_clip_features, obs_to_vit_features, obs
 
 @dataclass
 class Args:
-    env_id: Annotated[str, tyro.conf.arg(aliases=["-e"])] = "StackGreenCubeOnYellowCubeBakedTexInScene-v1"
+    env_id: Annotated[str, tyro.conf.arg(aliases=["-e"])] = "PutEggplantInBasketScene-v1"
     """The environment ID of the task you want to simulate. Can be one of
     PutCarrotOnPlateInScene-v1, PutSpoonOnTableClothInScene-v1, StackGreenCubeOnYellowCubeBakedTexInScene-v1, PutEggplantInBasketScene-v1"""
 
@@ -64,7 +64,7 @@ class Args:
     seed: Annotated[int, tyro.conf.arg(aliases=["-s"])] = 0
     name: str = "MOSAIC-test"
     
-    num_envs: int = 1
+    num_envs: int = 16
     episode_len: int = 80
     use_same_init: bool = False
     steps_max: int = 200000
@@ -94,6 +94,7 @@ class Args:
     only_render: bool = False
     render_info: bool = False
     num_eval_runs: int = 1
+    log_to_file: bool = False
     # MOSAIC-specific args
     force_sharing_test: bool = False
     comm_interval: int = 3
@@ -715,15 +716,22 @@ class Runner:
 
                 # --- Append to train Excel ---
                 if self.train_xlsx is not None:
-                    
-                    
-                    # Only append steps and mean_success
+                    # Only append steps, mean_success, and beta stats
                     mean_success = None
                     for k, v in train_mean.items():
                         if "success" in k:
                             mean_success = v
                             break
-                    train_row = {"steps": steps, "mean_success": mean_success}
+
+                    beta_stats = self.policy.get_beta_stats()
+                    train_row = {
+                        "steps": steps,
+                        "mean_success": mean_success,
+                        "beta_base": beta_stats.get("beta_base", np.nan),
+                        "beta1": beta_stats.get("beta1", np.nan),
+                        "beta2": beta_stats.get("beta2", np.nan),
+                        "beta3": beta_stats.get("beta3", np.nan),
+                    }
                     try:
                         df = pd.read_excel(self.train_xlsx)
                         df = pd.concat([df, pd.DataFrame([train_row])], ignore_index=True)
@@ -747,14 +755,22 @@ class Runner:
 
                 # --- Append to test Excel ---
                 if self.test_xlsx is not None:
-                    
-                    # Only append steps and mean_success
+                    # Only append steps, mean_success, and beta stats
                     mean_success = None
                     for k, v in test_mean.items():
                         if "success" in k:
                             mean_success = v
                             break
-                    test_row = {"steps": steps, "mean_success": mean_success}
+
+                    beta_stats = self.policy.get_beta_stats()
+                    test_row = {
+                        "steps": steps,
+                        "mean_success": mean_success,
+                        "beta_base": beta_stats.get("beta_base", np.nan),
+                        "beta1": beta_stats.get("beta1", np.nan),
+                        "beta2": beta_stats.get("beta2", np.nan),
+                        "beta3": beta_stats.get("beta3", np.nan),
+                    }
                     try:
                         df = pd.read_excel(self.test_xlsx)
                         df = pd.concat([df, pd.DataFrame([test_row])], ignore_index=True)
@@ -789,21 +805,32 @@ def main():
     pd.DataFrame().to_excel(train_xlsx, index=False)
     pd.DataFrame().to_excel(test_xlsx, index=False)
 
-    # Redirect stdout and stderr to log.txt
-    log_fh = open(log_file, "a")
-    sys.stdout = log_fh
-    sys.stderr = log_fh
+    handlers = []
+    log_fh = None
+    if args.log_to_file:
+        # Redirect stdout and stderr to log.txt
+        log_fh = open(log_file, "a")
+        sys.stdout = log_fh
+        sys.stderr = log_fh
+        handlers.extend([
+            logging.FileHandler(log_file),
+            logging.StreamHandler(log_fh)
+        ])
+    else:
+        # Keep output on terminal for debugging
+        handlers.append(logging.StreamHandler(sys.stdout))
 
     # Set up logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(log_fh)
-        ]
+        handlers=handlers
     )
-    logging.info("Logging started. Log file: %s", log_file)
+
+    if args.log_to_file:
+        logging.info("Logging started. Log file: %s", log_file)
+    else:
+        logging.info("Logging started. Outputting to terminal only.")
 
     
     
@@ -831,7 +858,8 @@ def main():
     else:
         runner.run()
     # Close log file at end
-    log_fh.close()
+    if log_fh:
+        log_fh.close()
 
 if __name__ == "__main__":
     main()
