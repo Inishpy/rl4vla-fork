@@ -38,7 +38,11 @@ def _top_r_svd(mat: torch.Tensor, r: int):
             torch.zeros((min(r, n),), device=mat.device, dtype=mat.dtype),
             torch.zeros((n, min(r, n)), device=mat.device, dtype=mat.dtype),
         )
-    U, S, Vh = torch.linalg.svd(mat, full_matrices=False)
+    mat_for_svd = mat
+    if mat.dtype in (torch.float16, torch.bfloat16):
+        # torch.linalg.svd CPU does not support bf16/float16; move to float32 for the op
+        mat_for_svd = mat.to(dtype=torch.float32)
+    U, S, Vh = torch.linalg.svd(mat_for_svd, full_matrices=False)
     r = min(r, S.numel())
     return U[:, :r], S[:r], Vh[:r, :].T
 
@@ -74,6 +78,10 @@ def _load_lora_state(lora_path: Path) -> Dict[str, torch.Tensor]:
         )
 
     return state
+
+
+def _move_state_to_device(state: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    return {k: v.to(device=device) for k, v in state.items()}
 
 
 def _merge_lora_states(
@@ -122,7 +130,14 @@ def _merge_lora_states(
             Wnew = Wnew.to(device=Wold.device)
 
         device = Wold.device
-        dtype = Wold.dtype
+        original_dtype = Wold.dtype
+        work_dtype = torch.float32 if original_dtype in (torch.float16, torch.bfloat16) else original_dtype
+
+        if Wold.dtype != work_dtype:
+            Wold = Wold.to(dtype=work_dtype)
+        if Wnew.dtype != work_dtype:
+            Wnew = Wnew.to(dtype=work_dtype)
+        dtype = original_dtype
 
         # Theta0 same as Wold per guidance
         W0 = Wold
@@ -199,7 +214,7 @@ class EvalArgs:
     seed: int = 0
     num_envs: int = 4
     episode_len: int = 80
-    num_eval_runs: int = 1
+    num_eval_runs: int = 4
 
     # OpenVLA policy settings (kept for compatibility)
     vla_temperature: float = 1.0
@@ -278,8 +293,15 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    state_a = _load_lora_state(Path(args.lora_a_path))
-    state_b = _load_lora_state(Path(args.lora_b_path))
+    if "cuda" in args.device:
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"Requested CUDA device {args.device} but CUDA is not available.")
+        target_device = torch.device(args.device)
+    else:
+        target_device = torch.device(args.device)
+
+    state_a = _move_state_to_device(_load_lora_state(Path(args.lora_a_path)), target_device)
+    state_b = _move_state_to_device(_load_lora_state(Path(args.lora_b_path)), target_device)
     merged_state = _merge_lora_states(state_a, state_b, args.merge_alpha)
 
     policy = _build_policy(args)
