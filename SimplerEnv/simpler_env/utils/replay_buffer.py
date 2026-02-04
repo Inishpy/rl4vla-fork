@@ -133,6 +133,38 @@ class SeparatedReplayBuffer(object):
             yield (obs_batch, instruct_batch, actions_batch, value_preds_batch, return_batch, masks_batch,
                    old_action_logits_batch, adv_targ)
 
+    def feed_forward_generator_sac(self):
+        """Generator that yields batches with next observations for SAC-style updates."""
+        episode_length, n_rollout_threads = self.rewards.shape[:2]
+        batch_size = episode_length * n_rollout_threads
+
+        if self.buffer_minibatch < 0:
+            num_mini_batch = 1
+        else:
+            assert batch_size % self.buffer_minibatch == 0
+            num_mini_batch = batch_size // self.buffer_minibatch
+
+        rand = torch.randperm(batch_size).numpy()
+        sampler = [rand[i * self.buffer_minibatch:(i + 1) * self.buffer_minibatch] for i in range(num_mini_batch)]
+
+        obs = self.obs[:-1].reshape(-1, *self.obs.shape[2:])
+        obs_next = self.obs[1:].reshape(-1, *self.obs.shape[2:])
+        actions = self.actions.reshape(-1, self.actions.shape[-1])
+        rewards = self.rewards.reshape(-1, 1)
+        masks_next = self.masks[1:].reshape(-1, 1)
+
+        for indices in sampler:
+            obs_batch = obs[indices]
+            obs_next_batch = obs_next[indices]
+            actions_batch = actions[indices]
+            rewards_batch = rewards[indices]
+            masks_next_batch = masks_next[indices]
+
+            instruct_indices = indices % n_rollout_threads
+            instruct_batch = [self.instruction[i] for i in instruct_indices]
+
+            yield (obs_batch, instruct_batch, actions_batch, rewards_batch, masks_next_batch, obs_next_batch)
+
 
 
 

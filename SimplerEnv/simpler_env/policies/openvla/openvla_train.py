@@ -70,7 +70,7 @@ class OpenVLAPolicy:
                 ds = json.load(open(path, "r"))
                 self.vla.base_model.norm_stats[self.args.vla_unnorm_key] = ds[self.args.vla_unnorm_key]
 
-        # Load frozen LoRA adaptors to be linearly combined (betas control their contribution; their weights stay frozen)
+        #Load frozen LoRA adaptors to be linearly combined (betas control their contribution; their weights stay frozen)
         # self.vla_lora1 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
         #     self.args.vla_path,
         #     attn_implementation="flash_attention_2",
@@ -82,28 +82,12 @@ class OpenVLAPolicy:
         # )
         # self.vla_lora1 = PeftModel.from_pretrained(
         #     self.vla_lora1,
-        #     "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-5qr1fw06/glob/steps_0239",    #PutEggplantInBasketScene-v1
+        #     "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-5qr1fw06/glob/steps_0239",    #PutEggplantInBasketScene-v1
         #     is_trainable=False
         # )
         # self.vla_lora1.requires_grad_(False)
 
-        self.vla_lora2 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
-            self.args.vla_path,
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            device_map="cuda:" + str(self.device_id),
-            vh_mode="a0",
-        )
-        self.vla_lora2 = PeftModel.from_pretrained(
-            self.vla_lora2,
-            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-b4w5dizr/glob/steps_0159",#/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
-            is_trainable=False
-        )
-        self.vla_lora2.requires_grad_(False)
-
-        # self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+        # self.vla_lora2 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
         #     self.args.vla_path,
         #     attn_implementation="flash_attention_2",
         #     torch_dtype=torch.bfloat16,
@@ -112,12 +96,28 @@ class OpenVLAPolicy:
         #     device_map="cuda:" + str(self.device_id),
         #     vh_mode="a0",
         # )
-        # self.vla_lora3 = PeftModel.from_pretrained(
-        #     self.vla_lora3,
-        #     "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-us074evv/glob/steps_0239",  #PutSpoonOnTableClothInScene-v1
+        # self.vla_lora2 = PeftModel.from_pretrained(
+        #     self.vla_lora2,
+        #     "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-b4w5dizr/glob/steps_0159",#/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
         #     is_trainable=False
         # )
-        # self.vla_lora3.requires_grad_(False)
+        # self.vla_lora2.requires_grad_(False)
+
+        self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+            self.args.vla_path,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map="cuda:" + str(self.device_id),
+            vh_mode="a0",
+        )
+        self.vla_lora3 = PeftModel.from_pretrained(
+            self.vla_lora3,
+            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-us074evv/glob/steps_0239",  #PutSpoonOnTableClothInScene-v1
+            is_trainable=False
+        )
+        self.vla_lora3.requires_grad_(False)
         
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-wldmtz9r/glob/steps_0239  #StackcubesInScene-v1
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-h53zetbs/glob/steps_0159  #PutOnPlateInScene25VisionImage-v1
@@ -233,7 +233,7 @@ class OpenVLAPolicy:
 
 
         # Patch betas to merge: trainable base (with its LoRA) + frozen lora1/2/3
-        patch_lora_layers(self.vla, self.vla_lora2) #self.vla_lora2, self.vla_lora3)
+        patch_lora_layers(self.vla, self.vla_lora3)#,self.vla_lora2, self.vla_lora3)
 
         # set value head trainable
         for name, param in self.vla.named_parameters():
@@ -454,6 +454,29 @@ class OpenVLAPPO:
         self.ppo_huber_delta = 10.0
         self.tpdv = self.policy.tpdv
         self.tpdv_vn = self.policy.tpdv_vn
+        # SAC-specific
+        self.sac_alpha = getattr(self.args, "sac_alpha", 0.2)
+        self.sac_value_coef = getattr(self.args, "sac_value_coef", 0.5)
+        # critics and target critics
+        obs_dim_flat = 480 * 640 * 3
+        act_dim = 7
+        # simple MLP critics over flattened image (placeholder; consider encoder)
+        self.q1 = nn.Sequential(
+            nn.Linear(obs_dim_flat + act_dim, 1024), nn.ReLU(),
+            nn.Linear(1024, 512), nn.ReLU(),
+            nn.Linear(512, 1)
+        ).to(self.tpdv_vn["device"])
+        self.q2 = nn.Sequential(
+            nn.Linear(obs_dim_flat + act_dim, 1024), nn.ReLU(),
+            nn.Linear(1024, 512), nn.ReLU(),
+            nn.Linear(512, 1)
+        ).to(self.tpdv_vn["device"])
+        import copy
+        self.q1_target = copy.deepcopy(self.q1)
+        self.q2_target = copy.deepcopy(self.q2)
+        self.sac_tau = 0.005
+        self.sac_gamma = self.args.buffer_gamma
+        self.q_optimizer = AdamW(list(self.q1.parameters()) + list(self.q2.parameters()), lr=self.args.vla_lr)
 
     def train_ppo_step(self, idx, total, batch):
         obs_image, instruct, actions, value_preds, returns, masks, old_logprob, advantages = batch
@@ -612,6 +635,94 @@ class OpenVLAPPO:
                 info = self.train_grpo_step(idx, minibatch_count, batch)
                 for key, value in info.items():
                     train_info[key].append(value)
+
+        final_info = {}
+        for key, value in train_info.items():
+            final_info[key] = np.mean(value)
+
+        return final_info
+
+    # --- SAC ---
+    def _soft_update(self, net, target):
+        for p, tp in zip(net.parameters(), target.parameters()):
+            tp.data.copy_(tp.data * (1.0 - self.sac_tau) + p.data * self.sac_tau)
+
+    def train_sac_step(self, idx, total, batch):
+        obs_image, instruct, actions, rewards, masks_next, obs_next = batch
+
+        # flatten obs for critics
+        obs_flat = torch.tensor(obs_image, device=self.tpdv_vn["device"], dtype=torch.float32).view(obs_image.shape[0], -1) / 255.0
+        obs_next_flat = torch.tensor(obs_next, device=self.tpdv_vn["device"], dtype=torch.float32).view(obs_next.shape[0], -1) / 255.0
+        actions = torch.tensor(actions, device=self.tpdv_vn["device"], dtype=torch.float32)
+        rewards = torch.tensor(rewards, device=self.tpdv_vn["device"], dtype=torch.float32)
+        masks_next = torch.tensor(masks_next, device=self.tpdv_vn["device"], dtype=torch.float32)
+
+        # policy: sample next action from current policy (re-use get_action)
+        with torch.no_grad():
+            # deterministic=False to sample
+            next_values, next_actions_token, next_logprob_token = self.policy.get_action(
+                dict(image=torch.tensor(obs_next).to(self.tpdv["device"]), task_description=instruct),
+                deterministic=False
+            )
+            # map token action to float? use token id as discrete action index
+            next_actions = next_actions_token.float().to(self.tpdv_vn["device"])
+            next_logprob = next_logprob_token.float().to(self.tpdv_vn["device"])
+
+            next_cat = torch.cat([obs_next_flat, next_actions], dim=-1)
+            q1_next = self.q1_target(next_cat)
+            q2_next = self.q2_target(next_cat)
+            q_next = torch.min(q1_next, q2_next)
+            target = rewards + self.sac_gamma * masks_next * (q_next - self.sac_alpha * next_logprob)
+
+        cat = torch.cat([obs_flat, actions], dim=-1)
+        q1_pred = self.q1(cat)
+        q2_pred = self.q2(cat)
+        q_loss = nn.functional.mse_loss(q1_pred, target) + nn.functional.mse_loss(q2_pred, target)
+
+        self.q_optimizer.zero_grad()
+        q_loss.backward()
+        nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
+        self.q_optimizer.step()
+
+        # policy loss: re-sample actions from policy on current obs
+        values_pi, actions_pi_token, logprob_pi_token = self.policy.get_action(
+            dict(image=torch.tensor(obs_image).to(self.tpdv["device"]), task_description=instruct),
+            deterministic=False
+        )
+        actions_pi = actions_pi_token.float().to(self.tpdv_vn["device"])
+        logprob_pi = logprob_pi_token.float().to(self.tpdv_vn["device"])
+        cat_pi = torch.cat([obs_flat, actions_pi], dim=-1)
+        q1_pi = self.q1(cat_pi)
+        q2_pi = self.q2(cat_pi)
+        q_pi = torch.min(q1_pi, q2_pi)
+        policy_loss = (self.sac_alpha * logprob_pi - q_pi).mean()
+
+        policy_loss.backward()
+        grad_norm = nn.utils.clip_grad_norm_(self.policy.params_vla, 10.0)
+        self.policy.vla_optimizer.step()
+        self.policy.vla_optimizer.zero_grad()
+
+        # soft update targets
+        self._soft_update(self.q1, self.q1_target)
+        self._soft_update(self.q2, self.q2_target)
+
+        info = dict(
+            sac_q_loss=q_loss.item(),
+            sac_policy_loss=policy_loss.item(),
+            sac_grad_norm=grad_norm.item() if grad_norm is not None else None,
+        )
+        return info
+
+    def train_sac(self, buffer):
+        train_info = defaultdict(lambda: [])
+
+        minibatch_count = buffer.get_minibatch_count()
+        data_generator = buffer.feed_forward_generator_sac()
+
+        for idx, batch in tqdm(enumerate(data_generator), total=minibatch_count, desc="train_sac"):
+            info = self.train_sac_step(idx, minibatch_count, batch)
+            for key, value in info.items():
+                train_info[key].append(value)
 
         final_info = {}
         for key, value in train_info.items():
