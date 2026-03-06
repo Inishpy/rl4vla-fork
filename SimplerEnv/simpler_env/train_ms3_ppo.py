@@ -69,7 +69,7 @@ class Args:
     use_same_init: bool = False
     steps_max: int = 200000
     steps_vh: int = 0
-    interval_eval: int = 5
+    interval_eval: int = 3
     interval_save: int = 40
     buffer_inferbatch: int = 2  #for rollout just pass chunks of env data to save memory
     buffer_minibatch: int = 2   #for training just pass chunks of stored buffer samples to save memory  
@@ -85,12 +85,14 @@ class Args:
     vla_optim_beta2: float = 0.999
     vla_temperature: float = 1.0
     vla_temperature_eval: float = 0.6
+    vla_shared_beta: bool = False
+    vla_beta_mode: str = "layerwise"
     alg_name: str = "ppo"
     alg_grpo_fix: bool = True
     alg_gradient_accum: int = 20
     alg_ppo_epoch: int = 1
     alg_entropy_coef: float = 0.0
-    wandb: bool = False
+    wandb: bool = True
     only_render: bool = False
     render_info: bool = False
     num_eval_runs: int = 3
@@ -149,9 +151,9 @@ class Runner:
         self.device = torch.device("cuda:" + str(device_id))
         self.policy = OpenVLAPolicy(all_args, device_id_other)
         # Freeze backbone
-        # Freeze only backbone parameters, keep LoRA and value head trainable
+        # Freeze only backbone parameters; keep LoRA, value head, and beta scalars trainable.
         for name, param in self.policy.vla.named_parameters():
-            if "lora" in name or "value_head" in name:
+            if "lora" in name or "value_head" in name or "beta" in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
@@ -799,9 +801,10 @@ def main():
     (log_dir / "@similarityheat").mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "log.txt"
 
-    # Create empty train.xlsx and test.xlsx at the beginning
-    train_xlsx = log_dir / "train.xlsx"
-    test_xlsx = log_dir / "test.xlsx"
+    # Create per-seed Excel files under the same timestamp/env directory.
+    run_tag = f"seed{args.seed}"
+    train_xlsx = log_dir / f"train_{run_tag}.xlsx"
+    test_xlsx = log_dir / f"test_{run_tag}.xlsx"
     pd.DataFrame().to_excel(train_xlsx, index=False)
     pd.DataFrame().to_excel(test_xlsx, index=False)
 

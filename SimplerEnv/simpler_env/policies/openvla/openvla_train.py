@@ -98,12 +98,12 @@ class OpenVLAPolicy:
         )
         self.vla_lora2 = PeftModel.from_pretrained(
             self.vla_lora2,
-            "/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-b4w5dizr/glob/steps_0159",#/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
+            "/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199", #"/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-b4w5dizr/glob/steps_0159",#/data/home/co/coimd/rl4vla-fork/wandb/offline-run-20251122_142616-upbt77d0/glob/steps_0199",   #PutCarrotOnPlateInScene-v1
             is_trainable=False
         )
         self.vla_lora2.requires_grad_(False)
 
-        # self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
+        #self.vla_lora3 = OpenVLAForActionPredictionWithValueHead.from_pretrained(
         #     self.args.vla_path,
         #     attn_implementation="flash_attention_2",
         #     torch_dtype=torch.bfloat16,
@@ -124,13 +124,17 @@ class OpenVLAPolicy:
         #/home/lunet/coimd/RL4VLA/wandb/offline-run-20251122_142616-b4w5dizr/glob/steps_0159  #PutOnPlateInScene25-v1
 
         # Patch all LoRA layers to use per-layer trainable betas for 1-3 adaptors
-        def patch_lora_layers(base_model, lora1, lora2=None, lora3=None):
+        def patch_lora_layers(base_model, lora1, lora2=None, lora3=None, shared_beta: bool = False):
             def beta_init_for_layer(layer_name: str, num_models: int, device: torch.device) -> torch.Tensor:
                 base = 1.0 / num_models
                 seed_int = int.from_bytes(hashlib.sha256(layer_name.encode("utf-8")).digest()[:8], "big")
                 scale = 0.9 + (seed_int % 21) / 100.0  # Deterministic spread in [0.90, 1.10]
                 value = min(max(base * scale, 1e-4), 1.0)
                 return torch.tensor(value, dtype=torch.float32, device=device)
+
+            def beta_init_shared(num_models: int, device: torch.device) -> torch.Tensor:
+                base = 1.0 / num_models
+                return torch.tensor(base, dtype=torch.float32, device=device)
 
             def has_lora_params(mod) -> bool:
                 # Only consider parameters **directly** on this module to avoid wrapping parents that merely
@@ -143,6 +147,21 @@ class OpenVLAPolicy:
             l1_mods = dict(lora1.named_modules())
             l2_mods = dict(lora2.named_modules()) if lora2 is not None else {}
             l3_mods = dict(lora3.named_modules()) if lora3 is not None else {}
+
+            # Shared betas: one trainable scalar per adaptor for the whole model
+            if shared_beta and not hasattr(base_model, "beta_base_shared"):
+                device = next(base_model.parameters()).device
+                num_models = 1 + 1 + (lora2 is not None) + (lora3 is not None)
+                init_value = beta_init_shared(num_models, device)
+
+                base_model.beta_base_shared = torch.nn.Parameter(init_value.clone())
+                base_model.register_parameter("beta_base_shared", base_model.beta_base_shared)
+                base_model.beta1_shared = torch.nn.Parameter(init_value.clone())
+                base_model.register_parameter("beta1_shared", base_model.beta1_shared)
+                base_model.beta2_shared = torch.nn.Parameter(init_value.clone())
+                base_model.register_parameter("beta2_shared", base_model.beta2_shared)
+                base_model.beta3_shared = torch.nn.Parameter(init_value.clone())
+                base_model.register_parameter("beta3_shared", base_model.beta3_shared)
 
             for name, mod_base in base_mods.items():
                 # Only patch layers that exist in base and lora1 (lora1 is required)
@@ -169,7 +188,7 @@ class OpenVLAPolicy:
                     mod_l3 = None
 
                 # Create beta for base model too
-                if not hasattr(mod_base, "beta_base"):
+                if not shared_beta and not hasattr(mod_base, "beta_base"):
                     device = next(mod_base.parameters()).device
                     num_models = 1 + 1 + (mod_l2 is not None) + (mod_l3 is not None)  # base + lora1 + optional
                     init_value = beta_init_for_layer(name, num_models, device)
@@ -210,19 +229,23 @@ class OpenVLAPolicy:
                         out_l1 = f1(*args, **kwargs)
                         
                         # All models treated equally
-                        b_base = torch.clamp(self.beta_base, 0.0, 1.0)
-                        b1 = torch.clamp(self.beta1, 0.0, 1.0)
+                        if shared_beta:
+                            b_base = torch.clamp(base_model.beta_base_shared, 0.0, 1.0)
+                            b1 = torch.clamp(base_model.beta1_shared, 0.0, 1.0)
+                        else:
+                            b_base = torch.clamp(self.beta_base, 0.0, 1.0)
+                            b1 = torch.clamp(self.beta1, 0.0, 1.0)
                         
                         result = b_base.to(out_base.dtype) * out_base + b1.to(out_base.dtype) * out_l1
                         
                         if f2 is not None:
                             out_l2 = f2(*args, **kwargs)
-                            b2 = torch.clamp(self.beta2, 0.0, 1.0)
+                            b2 = torch.clamp(base_model.beta2_shared, 0.0, 1.0) if shared_beta else torch.clamp(self.beta2, 0.0, 1.0)
                             result = result + b2.to(out_base.dtype) * out_l2
                         
                         if f3 is not None:
                             out_l3 = f3(*args, **kwargs)
-                            b3 = torch.clamp(self.beta3, 0.0, 1.0)
+                            b3 = torch.clamp(base_model.beta3_shared, 0.0, 1.0) if shared_beta else torch.clamp(self.beta3, 0.0, 1.0)
                             result = result + b3.to(out_base.dtype) * out_l3
                         
                         return result
@@ -232,8 +255,21 @@ class OpenVLAPolicy:
                 mod_base.forward = make_new_forward(base_forward, l1_forward, l2_forward, l3_forward).__get__(mod_base, mod_base.__class__)
 
 
+        beta_mode = getattr(self.args, "vla_beta_mode", None)
+        if beta_mode is None:
+            shared_beta = bool(getattr(self.args, "vla_shared_beta", False))
+        else:
+            beta_mode = str(beta_mode).strip().lower()
+            if beta_mode not in {"layerwise", "shared"}:
+                raise ValueError(f"Invalid vla_beta_mode={beta_mode!r}. Use 'layerwise' or 'shared'.")
+            shared_beta = (beta_mode == "shared")
+
         # Patch betas to merge: trainable base (with its LoRA) + frozen lora1/2/3
-        patch_lora_layers(self.vla, self.vla_lora2) #self.vla_lora2, self.vla_lora3)
+        patch_lora_layers(
+            self.vla,
+            self.vla_lora2,
+            shared_beta=shared_beta,
+        ) #self.vla_lora2, self.vla_lora3)
 
         # set value head trainable
         for name, param in self.vla.named_parameters():
@@ -280,7 +316,10 @@ class OpenVLAPolicy:
 
         Returns a dict with keys beta_base, beta1, beta2, beta3 when present.
         """
-        beta_keys = ("beta_base", "beta1", "beta2", "beta3")
+        beta_keys = (
+            "beta_base", "beta1", "beta2", "beta3",
+            "beta_base_shared", "beta1_shared", "beta2_shared", "beta3_shared"
+        )
         accum = {k: [] for k in beta_keys}
 
         for _, module in self.vla.named_modules():
@@ -290,7 +329,36 @@ class OpenVLAPolicy:
                     if isinstance(param, torch.Tensor):
                         accum[key].append(param.detach().float().mean().item())
 
-        return {k: float(np.mean(v)) for k, v in accum.items() if len(v) > 0}
+        stats = {k: float(np.mean(v)) for k, v in accum.items() if len(v) > 0}
+
+        # Keep logging keys stable across modes.
+        if "beta_base" not in stats and "beta_base_shared" in stats:
+            stats["beta_base"] = stats["beta_base_shared"]
+        if "beta1" not in stats and "beta1_shared" in stats:
+            stats["beta1"] = stats["beta1_shared"]
+        if "beta2" not in stats and "beta2_shared" in stats:
+            stats["beta2"] = stats["beta2_shared"]
+        if "beta3" not in stats and "beta3_shared" in stats:
+            stats["beta3"] = stats["beta3_shared"]
+
+        return stats
+
+    def get_all_beta_params(self, clamp: bool = False) -> dict:
+        """Return all beta parameters as a name->float dict for detailed logging."""
+        beta_params = {}
+        for name, param in self.vla.named_parameters():
+            if "beta" not in name:
+                continue
+            if not isinstance(param, torch.Tensor):
+                continue
+            p = param.detach().float()
+            if clamp:
+                p = torch.clamp(p, 0.0, 1.0)
+            if p.numel() == 1:
+                beta_params[name] = float(p.item())
+            else:
+                beta_params[name] = float(p.mean().item())
+        return beta_params
 
     def _preprocess_obs(self, x: dict, action: torch.Tensor = None) -> BatchFeature:
         images = x["image"]

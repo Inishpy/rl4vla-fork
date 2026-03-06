@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1            # we manage parallelism manually
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=1
 #SBATCH --time=48:00:00
 #SBATCH --account=Soltoggio2025a
 #SBATCH --output=job.%j.out
@@ -26,6 +26,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 ALGORITHM="simple"
+BETA_MODE="shared"  # "layerwise" (different beta per LoRA layer) or "shared" (same beta across all layers)
 SEEDS=(0 1 2 3)
 ENVS=("PutCarrotOnPlateInScene-v1" "PutSpoonOnTableClothInScene-v1"
     "StackGreenCubeOnYellowCubeBakedTexInScene-v1"
@@ -51,6 +52,7 @@ for i in "${!SEEDS[@]}"; do
     python3 $SCRIPT \
         --env_id $ENV_ID \
         --seed $SEED \
+        --vla-beta-mode $BETA_MODE \
         >> "$LOGFILE" 2>&1 &
 done
 
